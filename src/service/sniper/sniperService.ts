@@ -301,8 +301,7 @@ const monitorToken = async (
               logger.info(`[✅ MONITOR-INIT] ${mint.slice(0, 8)}... | Interval monitoring started successfully`);
             }
           } catch (monitorError) {
-            logger.error(`[❌ MONITOR-ERROR] ${mint.slice(0, 8)}... | Failed to initialize monitoring: ${monitorError.message}`);
-            // We don't want to fail the whole purchase if monitoring initialization fails
+            logger.error(`[❌ MONITOR-ERROR] ${mint.slice(0, 8)}... | Failed to initialize monitoring: ${monitorError instanceof Error ? monitorError.message : String(monitorError)}`);
           }
           
           return;

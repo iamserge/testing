@@ -75,6 +75,7 @@ export class WssMonitorService {
   private static debounceTimers: Map<string, NodeJS.Timeout> = new Map();
   private static readonly MAX_CONCURRENT_OPERATIONS = 3;
   private static activeOperationCount = 0;
+  private static memoryMonitorInterval: NodeJS.Timeout | null = null;
 
   /**
    * Helper method to acquire a global selling lock
