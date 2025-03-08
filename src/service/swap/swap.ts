@@ -66,7 +66,7 @@ export async function confirmVtxn(txn: VersionedTransaction, mint: string) {
     // Race between confirmation and timeout
     const txRlt = await Promise.race([confirmationPromise, timeoutPromise]);
     // Add type guard to check that txRlt has the expected structure
-    if (txRlt && typeof txRlt === 'object' && 'value' in txRlt && txRlt.value && 'err' in txRlt.value) {
+    if (txRlt && typeof txRlt === 'object' && 'value' in txRlt && txRlt.value && typeof txRlt.value === 'object' && 'err' in txRlt.value) {
       if (txRlt.value.err) {
         logger.error(`[❌ TX-ERROR] ${shortMint} | Transaction confirmation failed: ${JSON.stringify(txRlt.value.err)}`);
         return null;
