@@ -12,7 +12,7 @@ import { startBalanceMonitor } from "./service/sniper/getWalletBalance";
 import { WssMonitorService } from "./service/sniper/wssMonitorService";
 
 // Configuration flag to determine which sell monitoring approach to use
-const USE_WSS = true;
+export const USE_WSS = true;
 
 const server: Express = express();
 

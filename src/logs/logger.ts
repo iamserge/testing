@@ -85,6 +85,12 @@ class Logger {
     setInterval(cleanConsole, 1000 * 60 * 60);
     
   }
+  trackBuyToMonitorDelay(mint: string, buyTime: number, monitorStartTime: number): void {
+    const delayMs = monitorStartTime - buyTime;
+    const shortMint = mint.slice(0, 8) + '...';
+    console.log(`[📊 METRIC] ${shortMint} | Buy-to-monitor delay: ${delayMs}ms`);
+    // This could be expanded to store metrics for analysis
+  }
 
   getAllLogs(): Record<LogLevel, string> {
     const logs: Record<LogLevel, string> = {} as Record<LogLevel, string>;

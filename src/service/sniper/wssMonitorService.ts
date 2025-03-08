@@ -239,11 +239,14 @@ export class WssMonitorService {
     const shortMint = getTokenShortName(mintAddress);
     
     try {
+      // Add a timestamp to track when monitoring started
+      const monitorStartTime = Date.now();
+      
       if (this.activeSubscriptions.has(mintAddress)) {
-        logger.info(`[⚠️ DUPLICATE] Already monitoring ${shortMint}`);
+        logger.info(`[⚠️ DUPLICATE] Already monitoring ${shortMint} - skipping initialization`);
         return;
       }
-
+  
       const mint = new PublicKey(mintAddress);
       this.monitoredTokens.set(mintAddress, mint);
       
@@ -253,11 +256,13 @@ export class WssMonitorService {
       // Initialize lock as unlocked
       tokenSellingLock.set(mintAddress, false);
       
-      logger.info(`[🔍 MONITOR] Starting WebSocket monitoring for token: ${shortMint}`);
-
+      // Enhance logging to track the source of initialization
+      const initSource = tokenCreatedTime.has(mintAddress) ? "periodic scan" : "direct handoff";
+      logger.info(`[🔍 MONITOR] Starting WebSocket monitoring for token: ${shortMint} (source: ${initSource})`);
+  
       // Initialize token data
       await this.initializeTokenMonitoring(mintAddress);
-
+  
       // Subscribe to the token's liquidity pool account changes
       const poolData = await this.findLiquidityPoolForToken(mintAddress);
       if (poolData && poolData.poolAddress) {
@@ -267,13 +272,19 @@ export class WssMonitorService {
           'confirmed'
         );
         this.activeSubscriptions.set(mintAddress, subscriptionId);
-        logger.info(`[🔌 CONNECTED] WebSocket subscription established for ${shortMint} (pool account)`);
+        
+        const initTimeMs = Date.now() - monitorStartTime;
+        logger.info(`[🔌 CONNECTED] WebSocket subscription established for ${shortMint} (pool account) in ${initTimeMs}ms`);
       } else {
         // Fallback to program subscription if pool not found
         this.subscribeToTokenProgram(mintAddress);
+        
+        const initTimeMs = Date.now() - monitorStartTime;
+        logger.info(`[🔌 CONNECTED] Token program subscription established for ${shortMint} in ${initTimeMs}ms`);
       }
     } catch (error) {
       logger.error(`[❌ MONITOR-ERROR] Error starting monitoring for ${shortMint}: ${error instanceof Error ? error.message : String(error)}`);
+      throw error; // Re-throw to allow calling code to handle it
     }
   }
 
@@ -284,40 +295,47 @@ export class WssMonitorService {
     const shortMint = getTokenShortName(mintAddress);
     
     try {
+      const startTime = Date.now();
+      
       // Get token transaction history
       const tokenTxns = await SniperTxns.find({ mint: mintAddress }).sort({ date: -1 });
       const buyTx: ITransaction | undefined = tokenTxns.find((txn) => txn.swap === "BUY");
-
+  
       if (!buyTx) {
         logger.warn(`[❌ ERROR] No buy transaction found for token ${shortMint}`);
+        tokenSellingStep.delete(mintAddress);
         return;
       }
-
+  
       const investedPrice_usd = Number(buyTx.swapPrice_usd);
       const investedAmount = Number(buyTx.swapAmount) * 10 ** TOKEN_DECIMALS;
       
       if (!investedPrice_usd) {
         logger.warn(`[❌ ERROR] Invalid invested price for token ${shortMint}`);
+        tokenSellingStep.delete(mintAddress);
         return;
       }
-
+  
       const selling_step = tokenTxns.length - 1;
       tokenSellingStep.set(mintAddress, selling_step);
       
       // Set creation time if not already set
-      if (!tokenCreatedTime.has(mintAddress)) {
+      const isNewMonitor = !tokenCreatedTime.has(mintAddress);
+      if (isNewMonitor) {
         tokenCreatedTime.set(mintAddress, buyTx.txTime);
+        logger.info(`[🆕 NEW-MONITOR] ${shortMint} | Created new monitoring context`);
       }
       
       const tokenAge = Date.now() - (buyTx.txTime || Date.now());
-      const botSellConfig = SniperBotConfig.getSellConfig();
+      const ageFormatted = formatTimeElapsed(tokenAge);
       
-      logger.info(`[📊 INFO] ${shortMint} | Age: ${formatTimeElapsed(tokenAge)} | Buy Price: $${investedPrice_usd.toFixed(6)} | Initial Amount: ${(investedAmount / 10 ** TOKEN_DECIMALS).toFixed(4)} | Sell History: ${selling_step} txns`);
+      logger.info(`[📊 INFO] ${shortMint} | Age: ${ageFormatted} | Buy Price: $${investedPrice_usd.toFixed(6)} | Initial Amount: ${(investedAmount / 10 ** TOKEN_DECIMALS).toFixed(4)} | Sell History: ${selling_step} txns`);
       
       // Initialize price monitoring
       try {
         const { price: initialPrice_usd } = await getPumpTokenPriceUSD(mintAddress);
         
+        const botSellConfig = SniperBotConfig.getSellConfig();
         const durationSec = typeof botSellConfig.mcChange?.duration === 'number' ? 
           (botSellConfig.mcChange.duration > 1000 ? botSellConfig.mcChange.duration / 1000 : botSellConfig.mcChange.duration) : 
           10; // Default to 10 seconds if undefined
@@ -337,11 +355,13 @@ export class WssMonitorService {
         
         // Store the price data in the map
         tokenPriceData.set(mintAddress, priceData);
-        logger.info(`[🔄 PRICE-MONITOR] ${shortMint} | Created with initial price $${initialPrice_usd.toFixed(6)}, threshold ${percentValue}%, duration ${durationSec}s`);
+        
+        const initTimeMs = Date.now() - startTime;
+        logger.info(`[🔄 PRICE-MONITOR] ${shortMint} | Created with initial price $${initialPrice_usd.toFixed(6)}, threshold ${percentValue}%, duration ${durationSec}s | Init time: ${initTimeMs}ms`);
       } catch (priceError) {
         logger.error(`[❌ PRICE-ERROR] Failed to initialize price monitoring for ${shortMint}: ${priceError instanceof Error ? priceError.message : String(priceError)}`);
       }
-
+  
       // Set up periodic status logging (every 60 seconds)
       this.setupStatusLogging(mintAddress, buyTx.txTime, investedPrice_usd);
       

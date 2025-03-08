@@ -18,6 +18,10 @@ import chalk from "chalk";
 import { DBTokenList, IToken } from "../../models/TokenList";
 import { getWalletBalanceFromCache } from "./getWalletBalance";
 import { createAlert } from "../alarm/alarm";
+import { WssMonitorService } from "./wssMonitorService";
+import { tokenMonitorThread2Sell } from "./sellMonitorService";
+import { USE_WSS } from "../../index"; // You may need to export this from index.ts
+
 
 const PUMP_WALLET = new PublicKey(
   "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
@@ -276,10 +280,27 @@ const monitorToken = async (
             swapProfitPercent_usd: 0,
             dex: "Pumpfun",
           };
-          saveTXonDB(save_data);
-          // remove progress cache
-          // const tokenKey = `${tokenName}_${tokenSymbol}`;
-          // tokenBuyingMap.delete(tokenKey);
+          
+          // Save transaction to database
+          await saveTXonDB(save_data);
+          
+          // NEW CODE: Immediately start monitoring this token
+          logger.info(`[🔄 HANDOFF] ${mint.slice(0, 8)}... | Initiating immediate sell monitoring after purchase`);
+          try {
+            if (USE_WSS) {
+              // Start WebSocket monitoring for this token
+              await WssMonitorService.startMonitoring(mint);
+              logger.info(`[✅ MONITOR-INIT] ${mint.slice(0, 8)}... | WebSocket monitoring started successfully`);
+            } else {
+              // Start interval-based monitoring for this token
+              await tokenMonitorThread2Sell(mint);
+              logger.info(`[✅ MONITOR-INIT] ${mint.slice(0, 8)}... | Interval monitoring started successfully`);
+            }
+          } catch (monitorError) {
+            logger.error(`[❌ MONITOR-ERROR] ${mint.slice(0, 8)}... | Failed to initialize monitoring: ${monitorError.message}`);
+            // We don't want to fail the whole purchase if monitoring initialization fails
+          }
+          
           return;
         }
       }

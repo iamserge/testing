@@ -44,10 +44,16 @@ function getTokenShortName(mint: string): string {
 
 let botSellConfig = SniperBotConfig.getSellConfig();
 
-const tokenMonitorThread2Sell = async (mint: string) => {
+export const tokenMonitorThread2Sell = async (mint: string) => {
   const shortMint = getTokenShortName(mint);
   logger.info(`[🔍 MONITOR] Starting monitor thread for token ${shortMint}`);
-
+  
+  // Add logging to track direct initialization
+  const wasDirectlyInitialized = !tokenSellingStep.has(mint);
+  if (wasDirectlyInitialized) {
+    logger.info(`[🔄 DIRECT-INIT] ${shortMint} | Token monitoring directly initialized after purchase`);
+  }
+  
   try {
     const tokenTxns = await SniperTxns.find({ mint }).sort({ date: -1 });
     const buyTx: ITransaction | undefined = tokenTxns.find((txn) => txn.swap === "BUY");
