@@ -30,39 +30,39 @@ async function getDevState(mint: PublicKey, owner: PublicKey) {
   }
 }
 */
-export async function getMintDetails(mint: string): Promise<any> {
-  const tokenPublicKey = new PublicKey(mint);
-  const mintInfo = await getMint(connection, tokenPublicKey);
+// export async function getMintDetails(mint: string): Promise<any> {
+//   const tokenPublicKey = new PublicKey(mint);
+//   const mintInfo = await getMint(connection, tokenPublicKey);
 
-  const supply = Number(mintInfo.supply);
+//   const supply = Number(mintInfo.supply);
 
-  const allAccounts = await connection.getProgramAccounts(TOKEN_PROGRAM_ID, {
-    filters: [
-      { dataSize: 165 }, // Size of token account
-      { memcmp: { offset: 0, bytes: mint } }, // Filter for token mint
-    ],
-  });
+//   const allAccounts = await connection.getProgramAccounts(TOKEN_PROGRAM_ID, {
+//     filters: [
+//       { dataSize: 165 }, // Size of token account
+//       { memcmp: { offset: 0, bytes: mint } }, // Filter for token mint
+//     ],
+//   });
 
-  const holdersCount = allAccounts.length;
-  const holders = allAccounts
-    .map((accountInfo: any) => {
-      const data = accountInfo.account.data;
-      const amount = Number(data.readBigUInt64LE(64));
-      const percentage = (amount / supply) * 100;
+//   const holdersCount = allAccounts.length;
+//   const holders = allAccounts
+//     .map((accountInfo: any) => {
+//       const data = accountInfo.account.data;
+//       const amount = Number(data.readBigUInt64LE(64));
+//       const percentage = (amount / supply) * 100;
 
-      return {
-        amount,
-        percentage,
-      };
-    })
-    .filter((holder: any) => holder !== null);
+//       return {
+//         amount,
+//         percentage,
+//       };
+//     })
+//     .filter((holder: any) => holder !== null);
 
-  holders.sort((a: any, b: any) => b.amount - a.amount);
+//   holders.sort((a: any, b: any) => b.amount - a.amount);
 
-  const top10 = holders.slice(1, 10);
-  const top10HP = calculateTotalPercentage(top10);
-  return { mintInfo, top10HP, holdersCount };
-}
+//   const top10 = holders.slice(1, 10);
+//   const top10HP = calculateTotalPercentage(top10);
+//   return { mintInfo, top10HP, holdersCount };
+// }
 
 export const getMetadataFromMint = async (mint: string) => {
   try {

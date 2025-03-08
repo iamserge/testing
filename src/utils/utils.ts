@@ -1,4 +1,4 @@
-import { VersionedTransaction } from "@solana/web3.js";
+import { LAMPORTS_PER_SOL, PublicKey, VersionedTransaction } from "@solana/web3.js";
 import logger from "../logs/logger";
 import { SniperBotConfig } from "../service/setting/botConfigClass";
 import { connection, wallet } from "../config";
@@ -11,7 +11,7 @@ import {
   getPumpTokenPriceUSD,
   getTokenBalance,
 } from "../service/pumpfun/pumpfun";
-import { TOTAL_SUPPLY } from "./constants";
+import { PUMP_FUN_PROGRAM, TOTAL_SUPPLY } from "./constants";
 import {
   IDexScreenerResponse,
   ITxntmpData,
@@ -24,6 +24,8 @@ import { ITransaction, SniperTxns } from "../models/SniperTxns";
 import { swap } from "../service/swap/swap";
 import { getCachedSolPrice } from "../service/sniper/getBlock";
 import { getTokenDataforAssets } from "../service/assets/assets";
+
+const WSOL = "So11111111111111111111111111111111111111112";
 
 export const formatTimestamp = (timestamp: number) => {
   const date = new Date(timestamp);
@@ -114,8 +116,71 @@ export const getTokenPriceFromJupiter = async (mint: string) => {
   }
 };
 
+export const getSwapAmountByTxHash = async (txHash: string): Promise<{tokenAmount: number, solAmount: number}> => {
+  try {
+    let txn;
+    while(!txn) {
+      txn = await connection.getParsedTransaction(txHash,
+        { maxSupportedTransactionVersion: 0,
+          commitment: "confirmed"
+         },
+      );
+      sleepTime(2000);
+    }
+    if (
+      txn &&
+      txn.meta &&
+      txn.meta.preTokenBalances &&
+      txn.meta.postTokenBalances
+    ) {
+      const preData = txn.meta.preTokenBalances;
+      const postData = txn.meta.postTokenBalances;
+      let tokenAmount = 0;
+      let solAmount = 0;
+      const mints: { mint: string; amount: number }[] = [];
+      for (const item1 of preData) {
+        const _mint1 = item1.mint;
+        const _owner1 = item1.owner;
+        for (const item2 of postData) {
+          const _mint2 = item2.mint;
+          const _owner2 = item2.owner;
+          if (_mint1 === _mint2 && _owner1 === _owner2) {
+            const deltaAmount =
+              Number(item1.uiTokenAmount.uiAmount) -
+              Number(item2.uiTokenAmount.uiAmount);
+            const mint = _mint1;
+            if (deltaAmount === 0) continue;
+            mints.push({ mint: mint, amount: deltaAmount });
+          }
+        }
+      }
+      // txn.meta.preBalances.forEach((item, index) => console.log(item - txn.meta.postBalances[index]));
+      const mint_account = new PublicKey(mints[0].mint).toBuffer();
+      const [bondingCurve] = PublicKey.findProgramAddressSync(
+        [Buffer.from("bonding-curve"), mint_account],
+        PUMP_FUN_PROGRAM
+      );
+      const id = txn.transaction.message.accountKeys.findIndex((key) => key.pubkey.equals(bondingCurve));
+      // console.log(id);
+      solAmount = Math.abs((txn.meta.preBalances[id] - txn.meta.postBalances[id]) / LAMPORTS_PER_SOL);
+      tokenAmount = Math.abs(mints[0].amount);
+      return {
+        tokenAmount,
+        solAmount
+      };
+    }
+    else
+      throw new Error("failed to fetch txn swap data");
+  } catch (error: any) {
+    console.log("Error while running getSwapAmountByTxHash", error.message);
+    return {
+      tokenAmount: 0,
+      solAmount: 0
+    };
+  }
+}
+
 export const getSolPrice = async () => {
-  const WSOL = "So11111111111111111111111111111111111111112";
   const SOL_URL = `https://api.jup.ag/price/v2?ids=${WSOL}`;
   try {
     const BaseURL = SOL_URL;
@@ -147,8 +212,7 @@ export async function simulateTxn(txn: VersionedTransaction) {
     console.error("* Simulation Error:", err, logs);
     throw new Error(
       "Simulation txn. Please check your wallet balance and slippage." +
-        err +
-        logs
+        err
     );
   }
 }
@@ -184,52 +248,106 @@ export async function getDexscreenerData(
   }
 }
 
-export const sellTokenSwap = async (mint: string, amount: number, isAlert:boolean, isSellAll: boolean) => {
+export const sellTokenSwap = async (mint: string, amount: number, isAlert: boolean, isSellAll: boolean): Promise<string|null> => {
+  const shortMint = mint.slice(0, 8) + '...';
+  
   try {
-    if(!isSellAll && amount === 0) return;
+    if (!isSellAll && amount === 0) {
+      logger.error(`[❌ INVALID-INPUT] ${shortMint} | Cannot sell zero tokens. Operation aborted.`);
+      throw new Error("Amount is zero");
+    }
+    
+    logger.info(`[💰 SELL-REQUEST] ${shortMint} | Amount: ${(amount / 1000_000).toFixed(6)} | isAlert: ${isAlert} | isSellAll: ${isSellAll}`);
+    
     const botBuyConfig = SniperBotConfig.getBuyConfig();
-    const { price: currentPrice_usd, pumpData } = await getPumpTokenPriceUSD(mint);
-    const _tip = isSellAll ? 0.00001 : botBuyConfig.jitoTipAmount
+    
+    // Get token price and exchange information
+    logger.info(`[📊 PRICE-CHECK] ${shortMint} | Fetching current token price...`);
+    const { price: currentPrice_usd, pumpData, isRaydium } = await getPumpTokenPriceUSD(mint);
+    
+    if (!currentPrice_usd || currentPrice_usd === 0) {
+      logger.error(`[❌ PRICE-ERROR] ${shortMint} | Failed to get valid price information`);
+      return null;
+    }
+    
+    logger.info(`[📈 PRICE-INFO] ${shortMint} | Current price: $${currentPrice_usd.toFixed(6)} | Exchange: ${isRaydium ? "Raydium" : "Pumpfun"}`);
+    
+    // Adjust tip amount based on isSellAll
+    const tipAmount = isSellAll ? 0.00001 : botBuyConfig.jitoTipAmount;
+    logger.info(`[💵 FEE-INFO] ${shortMint} | Using tip amount: ${tipAmount} SOL`);
+    
+    // Create swap parameters
     const swapParam: SwapParam = {
       mint: mint,
-      amount: amount, // no decimals
-      tip: _tip, // no decimals
-      slippage: botBuyConfig.slippage, // 0.1 ~ 100
+      amount: amount,
+      tip: tipAmount,
+      slippage: botBuyConfig.slippage,
       is_buy: false,
       isSellAll: isSellAll,
       pumpData,
     };
+    
+    // Execute the swap
+    logger.info(`[🔄 EXECUTING] ${shortMint} | Calling swap function with slippage: ${botBuyConfig.slippage}%`);
     const swapResult = await swap(swapParam);
-    if (!isSellAll && swapResult && amount > 0) {
-      // const investedPrice_usd = Number(tokenData.investedPrice_usd);
+    
+    if (!swapResult) {
+      logger.error(`[❌ SWAP-FAILED] ${shortMint} | The swap function returned null`);
+      return null;
+    }
+    
+    const { txHash, price: executedPrice_usd, inAmount, outAmount, } = swapResult;
+    logger.info(`[✅ SWAP-SUCCESS] ${shortMint} | Swap executed at price: $${executedPrice_usd.toFixed(6)}`);
+    logger.info(`[📝 TX-DETAILS] ${shortMint} | TxHash: ${txHash?.slice(0, 8)}... | In: ${inAmount.toFixed(6)} tokens | Out: ${outAmount.toFixed(6)} SOL`);
+    
+    // For regular (non-sellAll) sells, we need to record the transaction
+    if (!isSellAll && amount > 0) {
+      // Lookup the buy transaction to calculate profit
       const buyTxn = await SniperTxns.findOne({
         mint: mint,
         swap: "BUY",
       });
-      const investedPrice_usd = buyTxn?.swapPrice_usd || 0;      
-      const { txHash} = swapResult;
-      logger.info(` - 🧩 sell swap tx: https://solscan.io/tx/${txHash}`);
-      const profit = (Number(currentPrice_usd - investedPrice_usd) * amount) / 1000_000;
-      const profitPercent = Number(currentPrice_usd / investedPrice_usd - 1) * 100;
+      
+      if (!buyTxn) {
+        logger.warn(`[⚠️ NO-BUY-RECORD] ${shortMint} | No buy transaction found for this token`);
+      }
+      
+      const investedPrice_usd = buyTxn?.swapPrice_usd || 0;
+      const profit = (Number(executedPrice_usd - investedPrice_usd) * amount) / 1000_000;
+      const profitPercent = Number(executedPrice_usd / investedPrice_usd - 1) * 100;
+      
+      logger.info(`[💹 PROFIT-CALC] ${shortMint} | Buy price: $${investedPrice_usd.toFixed(6)} | Profit: $${profit.toFixed(2)} (${profitPercent.toFixed(2)}%)`);
+      
       const solPrice = getCachedSolPrice();
+      
+      // Prepare transaction data for database
       const save_data: ITxntmpData = {
         isAlert: isAlert,
         txHash: txHash || "",
         mint: mint,
         swap: "SELL",
-        swapPrice_usd: currentPrice_usd,
-        swapAmount: amount / 1000_000,
-        swapFee_usd: botBuyConfig.jitoTipAmount * solPrice,
+        swapPrice_usd: executedPrice_usd,
+        swapAmount: inAmount,
+        swapFee_usd: tipAmount * solPrice,
         swapProfit_usd: profit,
         swapProfitPercent_usd: profitPercent,
+        dex: "Pumpfun"
       };
-
-      saveTXonDB(save_data);
-    } else {
-      return null;
+      
+      // Save transaction to database
+      logger.info(`[💾 SAVING-TX] ${shortMint} | Recording transaction in database`);
+      await saveTXonDB(save_data);
+    } else if (swapResult) {
+      // For sellAll operations, we don't need detailed profit calculations
+      logger.info(`[🔥 CLEANUP] ${shortMint} | Token cleaned up successfully with sellAll option`);
     }
-  } catch (error) {
-    console.log(error);
+    
+    return txHash;
+  } catch (error: any) {
+    logger.error(`[❌ SELL-ERROR] ${shortMint} | Error during sellTokenSwap: ${error.message}`);
+    if (error.stack) {
+      logger.error(`[❌ STACK-TRACE] ${shortMint} | ${error.stack.split('\n')[0]}`);
+    }
     return null;
   }
 };

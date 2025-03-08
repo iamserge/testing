@@ -62,8 +62,8 @@ export type PumpData = {
   associatedBondingCurve: PublicKey;
   virtualSolReserves: number;
   virtualTokenReserves: number;
-  realTokenReserves: number;
-  realSolReserves: number;
+  // realTokenReserves: number;
+  // realSolReserves: number;
   totalSupply: number;
   progress: number;
   price: number;
@@ -81,6 +81,7 @@ export interface ITxntmpData {
   swapFee_usd: number;
   swapProfit_usd?: number;
   swapProfitPercent_usd?: number;
+  dex: "Raydium" | "Pumpfun";
 }
 
 export interface ISwapTxResponse {
@@ -88,6 +89,7 @@ export interface ISwapTxResponse {
   inAmount: number;
   outAmount: number;
   price?: number;
+  needsAccountClose: boolean;
 }
 
 export interface ISwapHashResponse {
@@ -95,6 +97,7 @@ export interface ISwapHashResponse {
   price: number;
   inAmount: number;
   outAmount: number;
+  closeAccountTxHash: string;
 }
 
 export interface ITokenAnalysisData {
@@ -124,6 +127,7 @@ export interface ITokenAnalysisData {
     // tokenAmount?: number;
   };
   sellingStep?: number;
+  dex?: "Raydium" | "Pumpfun";
   revenue?: number;
   realisedProfit?: number;
   unRealizedProfit?: number;
@@ -203,14 +207,17 @@ interface MainConfig {
 }
 
 interface BuyConfig {
-  age: {
-    start: number;
-    end: number;
+  duplicates: {
     enabled: boolean;
-  };
+  }
   marketCap: {
     min: number;
     max: number;
+    enabled: boolean;
+  };
+  age: {
+    start: number;
+    end: number;
     enabled: boolean;
   };
   maxDevHoldingAmount: {
@@ -249,6 +256,10 @@ interface SellConfig {
     revenue: number;
   }>;
   lossExitPercent: number;
+  mcChange: {
+    percentValue: number,
+    duration: number
+  }
 }
 
 export interface BotSettings {

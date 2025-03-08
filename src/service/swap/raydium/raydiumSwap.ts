@@ -7,6 +7,7 @@ import {
 import { ISwapTxResponse, SwapParam } from "../../../utils/types";
 import { connection, wallet } from "../../../config";
 import {
+  ComputeBudgetProgram,
   LAMPORTS_PER_SOL,
   PublicKey,
   SystemProgram,
@@ -27,8 +28,10 @@ import {
 import { getWalletTokenAccount } from "../../../utils/utils";
 import { TOKEN_DECIMALS } from "../../../utils/constants";
 import { getPoolKeyMap } from "../../sniper/sellMonitorService";
-import { fetchPoolInfoByMint } from "./utils";
+import { calculateReserves, fetchPoolInfoByMint } from "./utils";
 import { formatAmmKeysById } from "./formatAmmByKeyId";
+import { BN } from "bn.js";
+import { tokenClose } from "../tokenClose";
 
 export const WSOL_TOKEN = new Token(
   TOKEN_PROGRAM_ID,
@@ -61,28 +64,42 @@ export const raydiumSwap = async (
     }
     poolKeys = jsonInfo2PoolKeys(targetPoolInfo) as LiquidityPoolKeys;
   }
+
+  const poolInfo = await calculateReserves(poolKeys);
   const { amountOut, minAmountOut, currentPrice } = Liquidity.computeAmountOut({
     poolKeys: poolKeys,
-    poolInfo: await Liquidity.fetchInfo({ connection, poolKeys }),
+    poolInfo: poolInfo,
     amountIn: inputTokenAmount,
     currencyOut: outputToken,
     slippage: slippageP,
   });
 
   let price = 0;
-  const decimalsDiff =
-      currentPrice.baseCurrency.decimals - currentPrice.quoteCurrency.decimals;
+  const decimalsDiff = currentPrice.baseCurrency.decimals - currentPrice.quoteCurrency.decimals;
   if ((currentPrice.baseCurrency as Token).mint.equals(NATIVE_MINT)) {
-    price =
-      Number(currentPrice.denominator) /
-      Number(currentPrice.numerator) /
-      10 ** decimalsDiff;
+    price = currentPrice.denominator.mul(new BN(LAMPORTS_PER_SOL)).div(currentPrice.numerator).toNumber() / 10 ** decimalsDiff / LAMPORTS_PER_SOL;
   } else {
-    price =
-      (Number(currentPrice.numerator) / Number(currentPrice.denominator)) *
-      10 ** decimalsDiff;
+    price = currentPrice.numerator.mul(new BN(LAMPORTS_PER_SOL)).div(currentPrice.denominator).toNumber() * 10 ** decimalsDiff / LAMPORTS_PER_SOL;      
   }
   price *=  getCachedSolPrice();
+
+
+  const _tmpMinAmt = minAmountOut.numerator.mul(new BN(LAMPORTS_PER_SOL)).div(minAmountOut.denominator).toNumber() / LAMPORTS_PER_SOL;
+  let wSolReserveAmount = poolKeys.baseMint.equals(NATIVE_MINT) ? poolInfo.baseReserve : poolInfo.quoteReserve;
+  wSolReserveAmount = wSolReserveAmount.div(new BN(LAMPORTS_PER_SOL));
+  if((wSolReserveAmount.toNumber() <= 0 || _tmpMinAmt < 0.000001) && is_buy === false) {
+    const isSellAll = swapParam.isSellAll || false;
+    const vTxn = await tokenClose(mint, inAmount, isSellAll);
+    const outAmount = amountOut.numerator.mul(new BN(LAMPORTS_PER_SOL)).div(amountOut.denominator).toNumber() / LAMPORTS_PER_SOL;
+    if(!vTxn) return null;
+    return {
+      vTxn: vTxn,
+      inAmount: inAmount / 10 ** inDecimal,
+      outAmount: outAmount,
+      price,
+      needsAccountClose: false,
+    }
+  }
   // console.log("raydium price", price);
   // console.log("got price", price);
   // -------- step 2: create instructions by SDK function --------
@@ -107,6 +124,12 @@ export const raydiumSwap = async (
   });
   const instructions: TransactionInstruction[] = [];
   instructions.push(
+    ComputeBudgetProgram.setComputeUnitLimit({
+      units: 100000
+    }),
+    ComputeBudgetProgram.setComputeUnitPrice({
+      microLamports: 300000
+    }),
     ...innerTransactions.flatMap((tx: any) => tx.instructions),
     feeInstructions
   );
@@ -132,16 +155,13 @@ export const raydiumSwap = async (
     instructions,
   }).compileToV0Message();
 
-  console.log("made a raydium swap txn", mint);
+  const outAmount = amountOut.numerator.mul(new BN(LAMPORTS_PER_SOL)).div(amountOut.denominator).toNumber() / LAMPORTS_PER_SOL;
 
   return {
     vTxn: new VersionedTransaction(messageV0),
     inAmount: inAmount / 10 ** inDecimal,
-    outAmount: Number(
-      Number(amountOut.numerator) /
-        Number(amountOut.denominator) /
-        10 ** inDecimal
-    ),
+    outAmount: outAmount,
     price,
+    needsAccountClose: false,
   };
 };

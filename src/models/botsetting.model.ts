@@ -7,14 +7,17 @@ const WorkingHoursSchema = new Schema({
 });
 
 const BuySettingsSchema = new Schema({
-  age: {
-    start: { type: Number, required: true },
-    end: { type: Number, required: true },
+  duplicates: {
     enabled: { type: Boolean, required: true }
   },
   marketCap: {
     min: { type: Number, required: true },
     max: { type: Number, required: true },
+    enabled: { type: Boolean, required: true }
+  },
+  age: {
+    start: { type: Number, required: true },
+    end: { type: Number, required: true },
     enabled: { type: Boolean, required: true }
   },
   maxDevHoldingAmount: {
@@ -54,7 +57,11 @@ const SaleRuleSchema = new Schema({
 
 const SellSettingsSchema = new Schema({
   saleRules: [SaleRuleSchema],
-  lossExitPercent: { type: Number, required: true }
+  lossExitPercent: { type: Number, required: true },
+  mcChange: {
+    percentValue: { type: Number, required: true},
+    duration: { type: Number, required: true}
+  }
 });
 
 const BotSettingsSchema = new Schema({

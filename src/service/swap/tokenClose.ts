@@ -16,14 +16,12 @@ import {
 import { TOKEN_DECIMALS } from "../../utils/constants";
 import { getLastValidBlockhash } from "../sniper/getBlock";
 
-const TOKEN_MINI_VALUE = 10;
-
 export const tokenClose = async (
   mint: string,
-  amount: number
+  amount: number,
+  isSellAll: boolean
 ): Promise<VersionedTransaction | null> => {
   if (!mint) return null;
-  console.log("tokenclose function called", amount);
   let instructions: TransactionInstruction[] = [];
 
   const tip = 0.000_001;
@@ -39,24 +37,27 @@ export const tokenClose = async (
     true
   );
   if (amount > 0) {
-    console.log("amount is larger than 0", amount);
+    // console.log("amount is larger than 0", amount);
     instructions.push(
       createBurnCheckedInstruction(
         splAta,
         new PublicKey(mint),
         wallet.publicKey,
-        amount * 10 ** TOKEN_DECIMALS, // with lamport
+        amount, // with lamport
         TOKEN_DECIMALS
       )
     );
   }
-  instructions.push(
-    createCloseAccountInstruction(
-      splAta,
-      wallet.publicKey,
-      wallet.publicKey
+  if(isSellAll) {
+
+    instructions.push(
+      createCloseAccountInstruction(
+        splAta,
+        wallet.publicKey,
+        wallet.publicKey
+      )
     )
-  )
+  }
   const blockhash = getLastValidBlockhash();
 
   const messageV0 = new TransactionMessage({

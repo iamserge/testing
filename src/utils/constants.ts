@@ -33,3 +33,5 @@ export const BLOXROUT_RECEIVER = new PublicKey(
 export const TOKEN_DECIMALS = 6;
 
 export const TOTAL_SUPPLY = 10 ** 9;
+
+export const PUMPFUN_IMG = "https://pump.fun/_next/image?url=%2Flogo.png&w=32&q=75";

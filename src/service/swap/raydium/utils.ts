@@ -6,10 +6,13 @@ import {
   Market,
   SPL_MINT_LAYOUT,
   MAINNET_PROGRAM_ID,
+  LiquidityPoolKeys,
+  LiquidityPoolInfo,
 } from "@raydium-io/raydium-sdk";
 import { PublicKey } from "@solana/web3.js";
 import { NATIVE_MINT } from "@solana/spl-token";
 import { connection } from "../../../config";
+import { BN } from "bn.js";
 
 // Function to fetch pool info using a mint address
 export async function fetchPoolInfoByMint(
@@ -150,4 +153,38 @@ async function decodePoolAndMarketInfo(
   // console.log("- Full pool data:", poolData);
 
   return poolData;
+}
+
+
+export const calculateReserves = async (poolKeys: LiquidityPoolKeys): Promise<LiquidityPoolInfo> => {
+  try {
+
+    // const baseReserve = await getTokenAmount(poolKeys.baseVault, connection);
+    // const quoteReserve = await getTokenAmount(poolKeys.quoteVault, connection);
+    const [base, quote] = await Promise.all([
+      await connection.getTokenAccountBalance(poolKeys.baseVault),
+      await connection.getTokenAccountBalance(poolKeys.quoteVault)
+    ])
+    const baseReserve = new BN(base.value.amount);
+    const quoteReserve = new BN(quote.value.amount);
+
+    const status = new BN(1); // this isn't used so just send back a default value
+    const lpDecimals = poolKeys.lpDecimals;
+    // const lpSupply = new BN(await getTokenAmount(poolKeys.lpVault, connection));
+    const lpSupply = new BN(1);// this isn't used so just send back a default value
+    const startTime = new BN(0); // this isn't used so just send back a default value
+    return {
+      status,
+      baseDecimals: poolKeys.baseDecimals,
+      quoteDecimals: poolKeys.quoteDecimals,
+      lpDecimals,
+      baseReserve,
+      quoteReserve,
+      lpSupply: lpSupply.div(new BN(10).pow(new BN(lpDecimals))),
+      startTime,
+    };
+  } catch (error) {
+    console.error('Failed to calculate reserves:', error);
+    throw error;
+  }
 }

@@ -1,10 +1,11 @@
 import { IAlertMsg, ITxntmpData } from "../../utils/types";
-import { ITransaction, SniperTxns } from "../../models/SniperTxns";
+import { SniperTxns } from "../../models/SniperTxns";
 import logger from "../../logs/logger";
 import { TokenAnalysis } from "../assets/tokenAnalysisService";
 import { TOTAL_SUPPLY } from "../../utils/constants";
 import { sniperService } from "../sniper/sniperService";
 import { createAlert } from "../alarm/alarm";
+import { IToken, DBTokenList } from "../../models/TokenList";
 // import { io } from "../..";
 
 // Get all transactions
@@ -42,10 +43,8 @@ export const getTransactionsByType = async (swap: "BUY" | "SELL") => {
 
 export async function fetchTokenData(mint: string): Promise<any> {
   try {
-    const buyTxn = await SniperTxns.findOne({
-      mint,
-      swap: "BUY",
-    });
+    
+    const buyTxn = await SniperTxns.findOne({ mint, swap: "BUY" });
     if (buyTxn) {
       return {
         name: buyTxn.tokenName,
@@ -57,7 +56,8 @@ export async function fetchTokenData(mint: string): Promise<any> {
     }
     const tmpdata = await fetch(`https://frontend-api.pump.fun/coins/${mint}`);
     const data = await tmpdata.json();
-
+    
+    const tokenData = await DBTokenList.findOne({ mint });
     if (!data.name || !data.symbol || !data.usd_market_cap) {
       return {
         name: "UNKNOWN",
@@ -66,8 +66,14 @@ export async function fetchTokenData(mint: string): Promise<any> {
         usd_market_cap: 0,
         buyMC_usd: 0,
       };
-    }
-    return data;
+    } 
+    return {
+      name: tokenData?.tokenName,
+      symbol: tokenData?.tokenSymbol,
+      image_uri: tokenData?.tokenImage,
+      usd_market_cap: 0,
+      buyMC_usd: 0,
+    };
   } catch (error) {
     return {
       name: "UNKNOWN",
@@ -89,6 +95,7 @@ export const saveTXonDB = async (save_data: ITxntmpData) => {
     swapFee_usd,
     swapProfit_usd,
     swapProfitPercent_usd,
+    dex,
   } = save_data; //
 
   try {
@@ -106,17 +113,37 @@ export const saveTXonDB = async (save_data: ITxntmpData) => {
       tokenSymbol: tokenSymbol,
       tokenImage: tokenImage,
       swap: swap,
-      swapPrice_usd: swapPrice_usd,
-      swapAmount: swapAmount,
-      swapFee_usd: swapFee_usd,
-      swapMC_usd: swapPrice_usd * TOTAL_SUPPLY,
+      swapPrice_usd: Number(swapPrice_usd),
+      swapAmount: Number(swapAmount),
+      swapFee_usd: Number(swapFee_usd),
+      swapMC_usd: Number(swapPrice_usd * TOTAL_SUPPLY),
       swapProfit_usd: Number(swapProfit_usd),
       swapProfitPercent_usd: Number(swapProfitPercent_usd),
-      buyMC_usd: buyMC_usd,
+      buyMC_usd: Number(buyMC_usd),
+      dex: dex,
     });
 
     await newTransaction.save();
     TokenAnalysis.updateCacheFromTransaction(newTransaction);
+
+    // if(swap === "BUY") {
+    //   try {
+    //     const tokenData: Partial<IToken> = {
+    //       mint: mint,
+    //       tokenName: tokenName.toString(),
+    //       tokenSymbol: tokenSymbol.toString(),
+    //       tokenImage: tokenImage.toString(),
+    //       saveTime: Date.now()
+    //     };
+    
+    //     const newToken = new DBTokenList(tokenData);
+    //     await newToken.save();
+    //     logger.info(`New token saved: ${tokenSymbol}`);
+    //   } catch (error:any) {
+    //     logger.error(`Failed to save token: ${error.message}`);
+    //   }
+    // }
+
     if (isAlert) {
       try {
         const alertData: IAlertMsg = {

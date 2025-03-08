@@ -49,23 +49,23 @@ class Logger {
   }
 
   info(message: string): void {
-    console.info(message);
-    this.writeLog(LogLevel.INFO, message);
+    console.log(`${this.getTimestamp()} ${message}`);
+    // this.writeLog(LogLevel.INFO, message);
   }
 
   error(message: string): void {
-    console.error(message);
-    this.writeLog(LogLevel.ERROR, message);
+    console.log(message);
+    // this.writeLog(LogLevel.ERROR, message);
   }
 
   warn(message: string): void {
-    console.warn(message);
-    this.writeLog(LogLevel.WARN, message);
+    console.log(message);
+    // this.writeLog(LogLevel.WARN, message);
   }
 
   critical(message: string): void {
     console.log(message);
-    this.writeLog(LogLevel.CRITICAL, message);
+    // this.writeLog(LogLevel.CRITICAL, message);
   }
 
   clearLogs(): void {
@@ -76,6 +76,14 @@ class Logger {
       }
     });
     console.info(START_TXT.log);
+    const cleanConsole = () => {
+      console.clear(); // Clears the console
+      process.stdout.write('\u001b[H\u001b[2J\u001b[3J'); // More thorough clearing including scrollback
+    }
+    
+    // Run cleanup every X seconds
+    setInterval(cleanConsole, 1000 * 60 * 60);
+    
   }
 
   getAllLogs(): Record<LogLevel, string> {

@@ -6,7 +6,7 @@ import dotenv from "dotenv";
 dotenv.config();
 
 export const config = {
-  serverPort: process.env.SERVER_PORT || 5000,
+  serverPort: process.env.SERVER_PORT || 6000,
   mongoUri: process.env.MONGO_URI || "mongodb://localhost:27017/my-db",
   jwtSecret: process.env.JWT_SECRET || "your-secret-key",
   jwtExpiresIn: "24h",
@@ -22,7 +22,7 @@ export const config = {
 
   update_cycle: 5 * 60 * 1000, // 1 minutes in milliseconds to update all data
   sell_monitor_cycle: 1 * 30 * 1000, // 30 seconds in milliseconds
-  lastBlock_Update_cycle: 1 * 1000, // 1 s
+  lastBlock_Update_cycle: 0.5 * 1000, // 1 s
 };
 
 const SOLANA_RPC_URL: string =
@@ -47,16 +47,6 @@ export enum START_TXT {
   db = "🌟 MongoDB connected...",
   sell = "💰 Sell monitor started...",
 }
-
-export const USER_EMAILS = [
-  "a@bonus.ru",
-  "Aspolifellc@gmail.com",
-  "didiasc@gmail.com",
-  "Pitlzback@gmail.com",
-  "ito.inoue.inf23@gmail.com",
-  "pleasebugmenot.dev@gmail.com",
-  "Pitlzback@gmail.com"
-];
 
 export const OPT_EXPIRE_TIME = 5 * 60 * 1000;
 export const SMTP_USER = process.env.SMTP_USER;

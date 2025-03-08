@@ -41,8 +41,12 @@ import {
   TokenAmount,
 } from "@raydium-io/raydium-sdk";
 import { WSOL_TOKEN } from "../swap/raydium/raydiumSwap";
-import { fetchPoolInfoByMint } from "../swap/raydium/utils";
+import { calculateReserves, fetchPoolInfoByMint } from "../swap/raydium/utils";
 import { getPoolKeyMap, setPoolKeyMap } from "../sniper/sellMonitorService";
+import logger from "../../logs/logger";
+
+const tokenPriceMap: Map<string, number> = new Map();
+
 
 export async function getPumpData(mint: PublicKey): Promise<PumpData | null> {
   const mint_account = mint.toBuffer();
@@ -113,8 +117,8 @@ export async function getPumpData(mint: PublicKey): Promise<PumpData | null> {
     associatedBondingCurve,
     virtualSolReserves,
     virtualTokenReserves,
-    realTokenReserves,
-    realSolReserves,
+    // realTokenReserves,
+    // realSolReserves,
     totalSupply,
     progress,
     price,
@@ -125,57 +129,65 @@ export async function getPumpData(mint: PublicKey): Promise<PumpData | null> {
 export async function getPumpTokenPriceUSD(mint: string): Promise<{
   price: number;
   pumpData?: PumpData;
+  isRaydium?: boolean;
 }> {
-  const pumpData = await getPumpData(new PublicKey(mint));
-  if (pumpData) {
-    return {
-      price: pumpData.price,
-      pumpData,
-    };
-  }
-  let poolKeys = getPoolKeyMap(mint);
-  if (!poolKeys) {
-    const poolId = await fetchPoolInfoByMint(mint);
-    console.log("poolId", poolId);
-    if (!poolId) {
+  try {
+    const pumpData = await getPumpData(new PublicKey(mint));
+    if (pumpData) {
       return {
-        price: 0,
+        price: pumpData.price,
+        pumpData,
+        isRaydium: false
       };
     }
-    const targetPoolInfo = await formatAmmKeysById(poolId);
-    if (!targetPoolInfo) {
-      return { price: 0 };
+    let poolKeys = getPoolKeyMap(mint);
+    if (!poolKeys) {
+      const poolId = await fetchPoolInfoByMint(mint);
+      if (!poolId) {
+        return {
+          price: tokenPriceMap.get(mint) || 0,
+          isRaydium: true
+        };
+      }
+      const targetPoolInfo = await formatAmmKeysById(poolId);
+      if (!targetPoolInfo) {
+        return {
+          price: tokenPriceMap.get(mint) || 0,
+          isRaydium: true
+        };
+      }
+      poolKeys = jsonInfo2PoolKeys(targetPoolInfo) as LiquidityPoolKeys;
+      setPoolKeyMap(mint, poolKeys);
     }
-    poolKeys = jsonInfo2PoolKeys(targetPoolInfo) as LiquidityPoolKeys;
-    setPoolKeyMap(mint, poolKeys);
+    const slippageP = new Percent(1, 100);
+    const MINT_TOKEN = new Token(TOKEN_PROGRAM_ID, mint, TOKEN_DECIMALS);
+    const inputTokenAmount = new TokenAmount(WSOL_TOKEN, 100);
+    const poolInfo = await calculateReserves(poolKeys)
+    const { currentPrice } = Liquidity.computeAmountOut({
+      poolKeys,
+      poolInfo,
+      amountIn: inputTokenAmount,
+      currencyOut: MINT_TOKEN,
+      slippage: slippageP,
+    });
+    let price = 0;
+    const decimalsDiff = currentPrice.baseCurrency.decimals - currentPrice.quoteCurrency.decimals;
+    if ((currentPrice.baseCurrency as Token).mint.equals(spl.NATIVE_MINT)) {
+      price = currentPrice.denominator.mul(new BN(LAMPORTS_PER_SOL)).div(currentPrice.numerator).toNumber() / 10 ** decimalsDiff / LAMPORTS_PER_SOL;
+    } else {
+      price = currentPrice.numerator.mul(new BN(LAMPORTS_PER_SOL)).div(currentPrice.denominator).toNumber() * 10 ** decimalsDiff / LAMPORTS_PER_SOL;      
+    }
+    price *=  getCachedSolPrice();
+    tokenPriceMap.set(mint, price);
+    // console.log("raydium price", price);
+    return { price, isRaydium: true };
+  } catch (error) {
+    logger.error("getPumpTokenPriceUSD error" + error);
+    return {
+      price: tokenPriceMap.get(mint) || 0,
+      isRaydium: true
+    };
   }
-  const slippageP = new Percent(1, 100);
-  const MINT_TOKEN = new Token(TOKEN_PROGRAM_ID, mint, TOKEN_DECIMALS);
-  const inputTokenAmount = new TokenAmount(WSOL_TOKEN, 100);
-  const poolInfo = await Liquidity.fetchInfo({ connection, poolKeys });
-  const { currentPrice } = Liquidity.computeAmountOut({
-    poolKeys,
-    poolInfo,
-    amountIn: inputTokenAmount,
-    currencyOut: MINT_TOKEN,
-    slippage: slippageP,
-  });
-  let price = 0;
-  const decimalsDiff =
-      currentPrice.baseCurrency.decimals - currentPrice.quoteCurrency.decimals;
-  if ((currentPrice.baseCurrency as Token).mint.equals(spl.NATIVE_MINT)) {
-    price =
-      Number(currentPrice.denominator) /
-      Number(currentPrice.numerator) /
-      10 ** decimalsDiff;
-  } else {
-    price =
-      (Number(currentPrice.numerator) / Number(currentPrice.denominator)) *
-      10 ** decimalsDiff;
-  }
-  price *=  getCachedSolPrice();
-  // console.log("raydium price", price);
-  return { price };
 }
 
 export function calculateSplOut(pumpData: PumpData, solIn: number): number {
@@ -365,7 +377,6 @@ export async function getTokenBalance(
       new PublicKey(tokenMintAddress),
       new PublicKey(walletAddress)
     );
-
     const tokenAccountInfo = await connection.getTokenAccountBalance(
       associatedTokenAddress
     );

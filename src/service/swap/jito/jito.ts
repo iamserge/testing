@@ -1,6 +1,7 @@
 import bs58 from "bs58";
 import axios from "axios";
 import { PublicKey } from "@solana/web3.js";
+import { connection } from "../../../config";
 
 const MAX_CHECK_JITO = 30;
 // Region => Endpoint
@@ -117,6 +118,34 @@ export class JitoBundleService {
         ) {
           retries = 0;
 
+          break;
+        }
+      } catch (error) {
+        // console.error("GetBundleStatus Failed");
+      }
+    }
+    if (retries === 0) return true;
+    return false;
+  }
+
+  async getTxnStatus(signature: string) {
+
+    let retries = 0;
+    // const now = Date.now();
+    while (retries < MAX_CHECK_JITO) {
+      try {
+        retries++;
+        const res = await connection.getSignatureStatus(signature);
+        // console.log(res.value?.confirmationStatus);
+        if (res.value?.err) {
+          await wait(1000);
+          continue;
+        }
+
+        if(res.value?.confirmationStatus === "confirmed" || res.value?.confirmationStatus === "finalized")
+        {
+          retries = 0;
+          // console.log("Got txn status in ", (Date.now() - now) + "ms");
           break;
         }
       } catch (error) {
