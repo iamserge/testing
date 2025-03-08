@@ -45,6 +45,9 @@ function formatTokenAmount(amount: number): string {
  */
 export async function confirmVtxn(txn: VersionedTransaction, mint: string) {
   const shortMint = getTokenShortName(mint);
+  const startTime = Date.now();
+  const CONFIRM_TIMEOUT_MS = 30000; // 30 seconds max wait
+  
   try {
     const rawTxn = txn.serialize();
     const jitoBundleInstance = new JitoBundleService();
@@ -54,7 +57,14 @@ export async function confirmVtxn(txn: VersionedTransaction, mint: string) {
 
     logger.info(`[🔶 JITO] ${shortMint} | Transaction sent, hash: ${txHash.slice(0, 8)}...`);
 
-    const txRlt = await connection.confirmTransaction(txHash);
+    // Set up confirmation with timeout
+    const confirmationPromise = connection.confirmTransaction(txHash);
+    const timeoutPromise = new Promise((_, reject) => 
+      setTimeout(() => reject(new Error("Transaction confirmation timeout")), CONFIRM_TIMEOUT_MS)
+    );
+    
+    // Race between confirmation and timeout
+    const txRlt = await Promise.race([confirmationPromise, timeoutPromise]);
     if (txRlt.value.err) {
       logger.error(`[❌ TX-ERROR] ${shortMint} | Transaction confirmation failed: ${JSON.stringify(txRlt.value.err)}`);
       return null;

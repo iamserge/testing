@@ -290,10 +290,14 @@ const monitorToken = async (
             if (USE_WSS) {
               // Start WebSocket monitoring for this token
               await WssMonitorService.startMonitoring(mint);
+              const buyTime = Date.now();
+              logger.trackBuyToMonitorDelay(mint, buyTime, Date.now());
               logger.info(`[✅ MONITOR-INIT] ${mint.slice(0, 8)}... | WebSocket monitoring started successfully`);
             } else {
               // Start interval-based monitoring for this token
               await tokenMonitorThread2Sell(mint);
+              const buyTime = Date.now(); 
+              logger.trackBuyToMonitorDelay(mint, buyTime, Date.now());
               logger.info(`[✅ MONITOR-INIT] ${mint.slice(0, 8)}... | Interval monitoring started successfully`);
             }
           } catch (monitorError) {

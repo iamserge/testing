@@ -73,37 +73,47 @@ export class WssMonitorService {
   private static readonly GLOBAL_LOCK_TIMEOUT_MS: number = 15000; // 15 second lock timeout
   private static readonly FAILED_TX_COOLDOWN_MS: number = 3000; // 3 second cooldown after failed tx
   private static debounceTimers: Map<string, NodeJS.Timeout> = new Map();
+  private static readonly MAX_CONCURRENT_OPERATIONS = 3;
+  private static activeOperationCount = 0;
 
   /**
    * Helper method to acquire a global selling lock
    */
+  
   private static acquireLock(mintAddress: string): boolean {
+    // Check if the specific token is locked
     if (tokenSellingLock.get(mintAddress)) {
       const shortMint = getTokenShortName(mintAddress);
       logger.info(`[🔒 LOCKED] ${shortMint} | Operation already in progress, cannot acquire lock`);
       return false;
     }
+    
+    // Check if we've hit the global concurrency limit
+    if (this.activeOperationCount >= this.MAX_CONCURRENT_OPERATIONS) {
+      const shortMint = getTokenShortName(mintAddress);
+      logger.info(`[⏳ QUEUE] ${shortMint} | Max concurrent operations (${this.MAX_CONCURRENT_OPERATIONS}) reached, waiting`);
+      return false;
+    }
+    
+    // Acquire the lock
     tokenSellingLock.set(mintAddress, true);
+    this.activeOperationCount++;
     
     // Auto-release lock after timeout as a safety mechanism
     setTimeout(() => {
       if (tokenSellingLock.get(mintAddress)) {
-        const shortMint = getTokenShortName(mintAddress);
-        logger.warn(`[🔓 AUTO-UNLOCK] ${shortMint} | Force releasing lock after timeout`);
-        tokenSellingLock.set(mintAddress, false);
+        this.releaseLock(mintAddress);
       }
     }, this.GLOBAL_LOCK_TIMEOUT_MS);
     
     return true;
   }
-  
-  /**
-   * Helper method to release a global selling lock
-   */
+
   private static releaseLock(mintAddress: string): void {
     const shortMint = getTokenShortName(mintAddress);
     logger.info(`[🔓 UNLOCKED] ${shortMint} | Released operation lock`);
     tokenSellingLock.set(mintAddress, false);
+    this.activeOperationCount = Math.max(0, this.activeOperationCount - 1);
   }
   
   /**
@@ -149,6 +159,27 @@ export class WssMonitorService {
     
     // Set up active price monitoring every 2 seconds
     this.startActiveMonitoring();
+
+    this.memoryMonitorInterval = setInterval(() => {
+      try {
+        // Get active token count
+        const activeTokenCount = this.monitoredTokens.size;
+        
+        // Check memory usage
+        const memoryUsage = process.memoryUsage();
+        const heapUsedMB = Math.round(memoryUsage.heapUsed / 1024 / 1024 * 100) / 100;
+        
+        logger.info(`[🧠 MEMORY] Active tokens: ${activeTokenCount} | Heap used: ${heapUsedMB}MB`);
+        
+        // If memory usage is high, force cleanup of older monitoring operations
+        if (heapUsedMB > 500) { // 500MB threshold
+          logger.warn(`[⚠️ HIGH-MEMORY] Initiating cleanup of older token monitors`);
+          this.cleanupOldestMonitors(5); // Remove 5 oldest monitors
+        }
+      } catch (error) {
+        logger.error(`[❌ MEMORY-ERROR] Error monitoring memory: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }, 300000);
   }
 
   /**
@@ -748,6 +779,25 @@ export class WssMonitorService {
     }
   }
 
+  private static cleanupOldestMonitors(count: number): void {
+    try {
+      // Get tokens sorted by creation time (oldest first)
+      const tokenEntries = Array.from(tokenCreatedTime.entries())
+        .sort((a, b) => a[1] - b[1]);
+      
+      // Take the oldest 'count' tokens
+      const tokensToRemove = tokenEntries.slice(0, count).map(entry => entry[0]);
+      
+      // Stop monitoring each token
+      for (const mint of tokensToRemove) {
+        const shortMint = getTokenShortName(mint);
+        logger.info(`[🧹 MEMORY-CLEANUP] ${shortMint} | Stopping monitoring to free memory`);
+        this.stopMonitoring(mint);
+      }
+    } catch (error) {
+      logger.error(`[❌ CLEANUP-ERROR] Error cleaning up old monitors: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
   /**
    * Evaluate if selling conditions are met
    */
