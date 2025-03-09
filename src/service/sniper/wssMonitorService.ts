@@ -33,7 +33,8 @@ const tokenCreatedTime: Map<string, number> = new Map();
 const statusLogIntervals: Map<string, NodeJS.Timeout> = new Map();
 const tokenPriceData: Map<string, PriceData> = new Map();
 const pendingTransactions: Map<string, PendingTransaction[]> = new Map();
-const tokenSellingLock: Map<string, boolean> = new Map();
+
+// REMOVED: tokenSellingLock map is removed to prevent locking tokens
 
 // New map to store direct buy transaction info (without DB lookups)
 const tokenBuyTxInfo: Map<string, Partial<ITransaction>> = new Map();
@@ -62,71 +63,30 @@ export class WssMonitorService {
   private static isInitialized: boolean = false;
   private static syncInterval: NodeJS.Timeout | null = null;
   private static activeMonitorInterval: NodeJS.Timeout | null = null;
-  private static readonly GLOBAL_LOCK_TIMEOUT_MS: number = 15000; // 15 second lock timeout
-  private static readonly MAX_CONCURRENT_OPERATIONS = 3;
-  private static activeOperationCount = 0;
   private static memoryMonitorInterval: NodeJS.Timeout | null = null;
 
-  /**
-   * Helper method to acquire a global selling lock
-   */
-  private static acquireLock(mintAddress: string): boolean {
-    // Check if the specific token is locked
-    if (tokenSellingLock.get(mintAddress)) {
-      const shortMint = getTokenShortName(mintAddress);
-      logger.info(`[🔒 LOCKED] ${shortMint} | Operation already in progress, cannot acquire lock`);
-      return false;
-    }
-    
-    // Check if we've hit the global concurrency limit
-    if (this.activeOperationCount >= this.MAX_CONCURRENT_OPERATIONS) {
-      const shortMint = getTokenShortName(mintAddress);
-      logger.info(`[⏳ QUEUE] ${shortMint} | Max concurrent operations (${this.MAX_CONCURRENT_OPERATIONS}) reached, waiting`);
-      return false;
-    }
-    
-    // Acquire the lock
-    tokenSellingLock.set(mintAddress, true);
-    this.activeOperationCount++;
-    
-    // Auto-release lock after timeout as a safety mechanism
-    setTimeout(() => {
-      if (tokenSellingLock.get(mintAddress)) {
-        this.releaseLock(mintAddress);
-      }
-    }, this.GLOBAL_LOCK_TIMEOUT_MS);
-    
-    return true;
-  }
+  // REMOVED: All lock-related methods and properties
 
-  private static releaseLock(mintAddress: string): void {
-    const shortMint = getTokenShortName(mintAddress);
-    logger.info(`[🔓 UNLOCKED] ${shortMint} | Released operation lock`);
-    tokenSellingLock.set(mintAddress, false);
-    this.activeOperationCount = Math.max(0, this.activeOperationCount - 1);
-  }
-  
   /**
    * Initialize the WebSocket monitoring service
    */
   public static initialize(): void {
     if (this.isInitialized) return;
     
-    logger.info(`${START_TXT.sell} ✨ WebSocket-based Sell monitor service started at ${new Date().toISOString()}`);
+    logger.info(`${START_TXT.sell} ✨ WebSocket-based Sell monitor service started at ${new Date().toISOString()} (NO LOCKS ENABLED)`);
     this.isInitialized = true;
     
     // Initialize maps
     pendingTransactions.clear();
-    tokenSellingLock.clear();
     tokenBuyTxInfo.clear();
     
     // Initial sync of monitored tokens
     this.syncMonitoredTokens();
     
     // Set up periodic sync to ensure we're monitoring all wallet tokens
-    this.syncInterval = setInterval(() => this.syncMonitoredTokens(), 60000); // Check every minute for new tokens
+    this.syncInterval = setInterval(() => this.syncMonitoredTokens(), 30000); // Check every 30 seconds for new tokens (more frequent)
     
-    // Set up active price monitoring every 2 seconds
+    // Set up active price monitoring every 1 second (more frequent than before)
     this.startActiveMonitoring();
 
     this.memoryMonitorInterval = setInterval(() => {
@@ -152,14 +112,14 @@ export class WssMonitorService {
   }
 
   /**
-   * Start active monitoring to check token prices every 2 seconds
+   * Start active monitoring to check token prices more frequently (every 1 second)
    */
   private static startActiveMonitoring(): void {
     if (this.activeMonitorInterval) {
       clearInterval(this.activeMonitorInterval);
     }
     
-    logger.info(`[⏱️ ACTIVE-MONITOR] Starting frequent price checks every 2 seconds`);
+    logger.info(`[⏱️ ACTIVE-MONITOR] Starting frequent price checks every 1 second (no locks)`);
     
     this.activeMonitorInterval = setInterval(async () => {
       try {
@@ -168,10 +128,7 @@ export class WssMonitorService {
           const shortMint = getTokenShortName(mintAddress);
           
           try {
-            // Check if there's an active lock first
-            if (tokenSellingLock.get(mintAddress)) {
-              continue;
-            }
+            // REMOVED: Check for active lock - always proceed with evaluation
             
             // Direct evaluation without queuing or debouncing
             try {
@@ -192,7 +149,7 @@ export class WssMonitorService {
       } catch (error) {
         logger.error(`[❌ ACTIVE-MONITOR-ERROR] Error in active monitoring loop: ${error instanceof Error ? error.message : String(error)}`);
       }
-    }, 2000); // Check every 2 seconds
+    }, 1000); // Check every 1 second (more aggressive monitoring)
   }
 
   /**
@@ -223,8 +180,7 @@ export class WssMonitorService {
   }
 
   /**
-   * NEW METHOD: Start monitoring a token with direct transaction data
-   * This method allows monitoring to start immediately without waiting for database records
+   * Start monitoring a token with direct transaction data
    */
   public static async startMonitoringWithData(
     mintAddress: string, 
@@ -273,9 +229,6 @@ export class WssMonitorService {
       
       // Initialize pending transactions array
       pendingTransactions.set(mintAddress, []);
-      
-      // Initialize lock as unlocked
-      tokenSellingLock.set(mintAddress, false);
       
       logger.info(`[🔍 MONITOR] Starting WebSocket monitoring for token: ${shortMint} (source: direct handoff)`);
   
@@ -333,9 +286,6 @@ export class WssMonitorService {
       
       // Initialize pending transactions array
       pendingTransactions.set(mintAddress, []);
-      
-      // Initialize lock as unlocked
-      tokenSellingLock.set(mintAddress, false);
       
       // Enhance logging to track the source of initialization
       const initSource = tokenCreatedTime.has(mintAddress) ? "periodic scan" : "database lookup";
@@ -623,7 +573,7 @@ export class WssMonitorService {
       clearInterval(statusLogIntervals.get(mintAddress)!);
     }
     
-    // Set up new interval (log every 60 seconds - more frequent than before)
+    // Set up new interval (log every 60 seconds)
     const interval = setInterval(async () => {
       try {
         const { price: currentPrice_usd } = await getPumpTokenPriceUSD(mintAddress);
@@ -648,24 +598,8 @@ export class WssMonitorService {
   }
 
   /**
-   * Check if there's already a pending transaction for a specific sell step
-   */
-  private static hasPendingTransaction(mintAddress: string, sellStep?: number, isStagnationSell = false): boolean {
-    const pending = pendingTransactions.get(mintAddress) || [];
-    
-    if (isStagnationSell) {
-      return pending.some(tx => tx.isStagnationSell === true);
-    }
-    
-    if (sellStep !== undefined) {
-      return pending.some(tx => tx.sellStep === sellStep);
-    }
-    
-    return pending.length > 0;
-  }
-
-  /**
    * Adds a pending transaction to the tracking map
+   * We still track pending transactions for reference but don't use it to block new sells
    */
   private static addPendingTransaction(
     mintAddress: string, 
@@ -792,11 +726,7 @@ export class WssMonitorService {
       
       // With direct evaluation:
       try {
-        // Check if there's an active lock
-        if (tokenSellingLock.get(mintAddress)) {
-          logger.info(`[🔒 POOL-EVENT] ${shortMint} | Skipping evaluation due to active lock`);
-          return;
-        }
+        // REMOVED: Check for active lock - always proceed with evaluation
         
         // Clean up any expired transactions
         this.cleanupExpiredTransactions(mintAddress);
@@ -834,11 +764,7 @@ export class WssMonitorService {
       logger.info(`[⚡ EVENT] Detected token program change for ${shortMint}, evaluating...`);
       
       try {
-        // Check if there's an active lock
-        if (tokenSellingLock.get(mintAddress)) {
-          logger.info(`[🔒 TOKEN-EVENT] ${shortMint} | Skipping evaluation due to active lock`);
-          return;
-        }
+        // REMOVED: Check for active lock - always proceed with evaluation
         
         // Clean up any expired transactions
         this.cleanupExpiredTransactions(mintAddress);
@@ -896,18 +822,9 @@ export class WssMonitorService {
     const botSellConfig = SniperBotConfig.getSellConfig();
     
     try {
-      // First check - do we have a lock?
-      if (tokenSellingLock.get(mintAddress)) {
-        logger.info(`[🔒 EVAL] ${shortMint} | Evaluation skipped due to active operation lock`);
-        return;
-      }
+      // REMOVED: First check for active lock - always proceed with evaluation
       
-      // Second check - do we have pending transactions?
-      if (this.hasPendingTransaction(mintAddress)) {
-        const pendingList = pendingTransactions.get(mintAddress) || [];
-        logger.info(`[⏳ PENDING] ${shortMint} | Evaluation skipped due to ${pendingList.length} pending transactions`);
-        return;
-      }
+      // REMOVED: Check for pending transactions - we want to sell aggressively now
       
       if (!tokenData || tokenData.currentAmount <= 0) {
         logger.info(`[🚫 ZERO] ${shortMint} | Current token amount is zero, stopping monitor`);
@@ -941,188 +858,163 @@ export class WssMonitorService {
         return;
       }
       
-      // Acquire global lock before attempting any sell operation
-      if (!this.acquireLock(mintAddress)) {
-        logger.info(`[🔒 LOCKED] ${shortMint} | Cannot proceed with evaluation, token is locked`);
+      // Calculate price change percentage
+      const raisePercent = ((currentPrice_usd / investedPrice_usd) - 1) * 100;
+      
+      // PRIORITY 1: Check for price stagnation
+      if (this.shouldSellDueToStagnation(mintAddress, currentPrice_usd)) {
+        logger.info(`[💰 SELL-SIGNAL] ${shortMint} | Selling due to insufficient price growth | Price: $${currentPrice_usd.toFixed(6)} (${raisePercent > 0 ? "+" : ""}${raisePercent.toFixed(2)}%)`);
+        
+        try {
+          const txResult = await sellTokenSwap(mintAddress, curTokenAmount, true, false);
+          if (txResult) {
+            // Add to pending transactions if valid hash returned
+            if (typeof txResult === 'string') {
+              this.addPendingTransaction(mintAddress, txResult, curTokenAmount, undefined, true);
+              logger.info(`[🔄 PENDING] ${shortMint} | Stagnation sell transaction pending | TxHash: ${txResult.slice(0, 8)}...`);
+            }
+            
+            logger.info(`[✅ SOLD] ${shortMint} | Sold due to insufficient price growth | Amount: ${curTokenAmount / 10 ** TOKEN_DECIMALS} | Price: $${currentPrice_usd.toFixed(6)} | TxHash: ${typeof txResult === 'string' ? txResult.slice(0, 8) + '...' : 'N/A'}`);
+            this.stopMonitoring(mintAddress);
+            return;
+          } else {
+            logger.error(`[❌ SELL-ERROR] ${shortMint} | Failed to sell tokens due to insufficient growth`);
+          }
+        } catch (error) {
+          logger.error(`[❌ SELL-ERROR] ${shortMint} | Error during price stagnation sell: ${error instanceof Error ? error.message : String(error)}`);
+        }
         return;
       }
       
-      try {
-        // Calculate price change percentage
-        const raisePercent = ((currentPrice_usd / investedPrice_usd) - 1) * 100;
+      // PRIORITY 2: Auto sell tokens if MC < $7K and age > 48h
+      const now = Date.now();
+      const createdTime = tokenCreatedTime.get(mintAddress) || 0;
+      const mcUsd = currentPrice_usd * TOTAL_SUPPLY;
+      
+      if (mcUsd < 7000 && now - createdTime > 2 * 24 * 60 * 60 * 1000) {
+        logger.info(`[💰 SELL-SIGNAL] ${shortMint} | Selling because MC < $7K and age > 48h | MC: $${mcUsd.toFixed(2)}`);
         
-        // PRIORITY 1: Check for price stagnation
-        if (this.shouldSellDueToStagnation(mintAddress, currentPrice_usd)) {
-          logger.info(`[💰 SELL-SIGNAL] ${shortMint} | Selling due to insufficient price growth | Price: $${currentPrice_usd.toFixed(6)} (${raisePercent > 0 ? "+" : ""}${raisePercent.toFixed(2)}%)`);
+        try {
+          const txResult = await sellTokenSwap(mintAddress, curTokenAmount, true, false);
+          if (txResult) {
+            // Add to pending transactions if valid hash returned
+            if (typeof txResult === 'string') {
+              this.addPendingTransaction(mintAddress, txResult, curTokenAmount);
+              logger.info(`[🔄 PENDING] ${shortMint} | Low MC sell transaction pending | TxHash: ${txResult.slice(0, 8)}...`);
+            }
+            
+            logger.info(`[✅ SOLD] ${shortMint} | Sold due to low MC and age | Amount: ${curTokenAmount / 10 ** TOKEN_DECIMALS} | Price: $${currentPrice_usd.toFixed(6)} | TxHash: ${typeof txResult === 'string' ? txResult.slice(0, 8) + '...' : 'N/A'}`);
+            this.stopMonitoring(mintAddress);
+            return;
+          } else {
+            logger.error(`[❌ SELL-ERROR] ${shortMint} | Failed to sell tokens with low MC`);
+          }
+        } catch (error) {
+          logger.error(`[❌ SELL-ERROR] ${shortMint} | Error during low MC sell: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        return;
+      }
+      
+      // PRIORITY 3: Check loss exit condition
+      if (raisePercent < 0 && Math.abs(raisePercent) > botSellConfig.lossExitPercent) {
+        logger.info(`[💰 SELL-SIGNAL] ${shortMint} | Price dropped below stop loss (${raisePercent.toFixed(2)}% < -${botSellConfig.lossExitPercent}%)`);
+        
+        try {
+          const txResult = await sellTokenSwap(mintAddress, curTokenAmount, true, false);
+          if (txResult) {
+            // Add to pending transactions if valid hash returned
+            if (typeof txResult === 'string') {
+              this.addPendingTransaction(mintAddress, txResult, curTokenAmount);
+              logger.info(`[🔄 PENDING] ${shortMint} | Stop loss sell transaction pending | TxHash: ${txResult.slice(0, 8)}...`);
+            }
+            
+            logger.info(`[✅ SOLD] ${shortMint} | Sold due to stop loss | Amount: ${curTokenAmount / 10 ** TOKEN_DECIMALS} | Price: $${currentPrice_usd.toFixed(6)} | TxHash: ${typeof txResult === 'string' ? txResult.slice(0, 8) + '...' : 'N/A'}`);
+            this.stopMonitoring(mintAddress);
+            return;
+          } else {
+            logger.error(`[❌ SELL-ERROR] ${shortMint} | Failed to sell on stop loss`);
+          }
+        } catch (error) {
+          logger.error(`[❌ SELL-ERROR] ${shortMint} | Error during stop loss sell: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        return;
+      }
+      
+      // PRIORITY 4: Check progressive profit-taking
+      const selling_step = tokenSellingStep.get(mintAddress) || 0;
+      if (selling_step >= 4) {
+        logger.info(`[🏁 COMPLETE] ${shortMint} | All sell steps completed (${selling_step}/4)`);
+        this.stopMonitoring(mintAddress);
+        return;
+      }
+      
+      const sellRules = botSellConfig.saleRules;
+      const sellSumPercent = sellRules.reduce((acc, rule) => acc + rule.percent, 0);
+      
+      // Check if we should proceed with a step sell
+      for (let checkStep = selling_step; checkStep < 4; checkStep++) {
+        const rule = sellRules[checkStep];
+        
+        if (raisePercent >= rule.revenue) {
+          logger.info(`[💰 STEP-SELL] ${shortMint} | Step ${checkStep + 1}/4 | Target: ${rule.revenue.toFixed(2)}% | Current: ${raisePercent.toFixed(2)}% | Selling: ${rule.percent}%`);
+          
+          const sellPercent = rule.percent;
+          
+          // Get the invested amount from direct data if possible
+          let investedAmount = 0;
+          if (directData && directData.swapAmount) {
+            investedAmount = Number(directData.swapAmount) * 10 ** TOKEN_DECIMALS;
+            logger.info(`[💾 USING-DIRECT-AMOUNT] ${shortMint} | Using amount from direct data: ${directData.swapAmount}`);
+          } else {
+            investedAmount = tokenData.investedAmount * 10 ** TOKEN_DECIMALS;
+            logger.info(`[💾 USING-ASSET-AMOUNT] ${shortMint} | Using amount from asset service: ${tokenData.investedAmount}`);
+          }
+          
+          let sellAmount;
+          if (checkStep === 3 && sellSumPercent === 100) {
+            // Final step - sell all remaining
+            sellAmount = curTokenAmount;
+            logger.info(`[🔄 FINAL-SELL] ${shortMint} | Selling all remaining tokens: ${curTokenAmount / 10 ** TOKEN_DECIMALS}`);
+          } else {
+            // Partial sell according to the rule
+            sellAmount = Math.min(
+              Math.floor((investedAmount * sellPercent) / 100), 
+              curTokenAmount
+            );
+            logger.info(`[🔄 PARTIAL-SELL] ${shortMint} | Selling ${sellAmount / 10 ** TOKEN_DECIMALS} tokens (${sellPercent}% of initial investment)`);
+          }
           
           try {
-            const txResult = await sellTokenSwap(mintAddress, curTokenAmount, true, false);
+            const txResult = await sellTokenSwap(
+              mintAddress, 
+              sellAmount, 
+              checkStep === 3, 
+              false
+            );
+            
             if (txResult) {
               // Add to pending transactions if valid hash returned
               if (typeof txResult === 'string') {
-                this.addPendingTransaction(mintAddress, txResult, curTokenAmount, undefined, true);
-                logger.info(`[🔄 PENDING] ${shortMint} | Stagnation sell transaction pending | TxHash: ${txResult.slice(0, 8)}...`);
+                this.addPendingTransaction(mintAddress, txResult, sellAmount, checkStep);
+                logger.info(`[🔄 PENDING] ${shortMint} | Step ${checkStep + 1} sell transaction pending | TxHash: ${txResult.slice(0, 8)}...`);
               }
               
-              logger.info(`[✅ SOLD] ${shortMint} | Sold due to insufficient price growth | Amount: ${curTokenAmount / 10 ** TOKEN_DECIMALS} | Price: $${currentPrice_usd.toFixed(6)} | TxHash: ${typeof txResult === 'string' ? txResult.slice(0, 8) + '...' : 'N/A'}`);
-              this.stopMonitoring(mintAddress);
-              return;
+              logger.info(`[✅ STEP-SOLD] ${shortMint} | Successfully executed step ${checkStep + 1} sell | Amount: ${sellAmount / 10 ** TOKEN_DECIMALS} | Price: $${currentPrice_usd.toFixed(6)} | TxHash: ${typeof txResult === 'string' ? txResult.slice(0, 8) + '...' : 'N/A'}`);
+              
+              tokenSellingStep.set(mintAddress, checkStep + 1);
+              
+              if (checkStep === 3) {
+                this.stopMonitoring(mintAddress);
+              }
             } else {
-              logger.error(`[❌ SELL-ERROR] ${shortMint} | Failed to sell tokens due to insufficient growth`);
+              logger.error(`[❌ SELL-ERROR] ${shortMint} | Failed to execute step ${checkStep + 1} sell`);
             }
           } catch (error) {
-            logger.error(`[❌ SELL-ERROR] ${shortMint} | Error during price stagnation sell: ${error instanceof Error ? error.message : String(error)}`);
-          } finally {
-            this.releaseLock(mintAddress);
+            logger.error(`[❌ SELL-ERROR] ${shortMint} | Error during step ${checkStep + 1} sell: ${error instanceof Error ? error.message : String(error)}`);
           }
-          return;
-        }
-        
-        // PRIORITY 2: Auto sell tokens if MC < $7K and age > 48h
-        const now = Date.now();
-        const createdTime = tokenCreatedTime.get(mintAddress) || 0;
-        const mcUsd = currentPrice_usd * TOTAL_SUPPLY;
-        
-        if (mcUsd < 7000 && now - createdTime > 2 * 24 * 60 * 60 * 1000) {
-          logger.info(`[💰 SELL-SIGNAL] ${shortMint} | Selling because MC < $7K and age > 48h | MC: $${mcUsd.toFixed(2)}`);
           
-          try {
-            const txResult = await sellTokenSwap(mintAddress, curTokenAmount, true, false);
-            if (txResult) {
-              // Add to pending transactions if valid hash returned
-              if (typeof txResult === 'string') {
-                this.addPendingTransaction(mintAddress, txResult, curTokenAmount);
-                logger.info(`[🔄 PENDING] ${shortMint} | Low MC sell transaction pending | TxHash: ${txResult.slice(0, 8)}...`);
-              }
-              
-              logger.info(`[✅ SOLD] ${shortMint} | Sold due to low MC and age | Amount: ${curTokenAmount / 10 ** TOKEN_DECIMALS} | Price: $${currentPrice_usd.toFixed(6)} | TxHash: ${typeof txResult === 'string' ? txResult.slice(0, 8) + '...' : 'N/A'}`);
-              this.stopMonitoring(mintAddress);
-              return;
-            } else {
-              logger.error(`[❌ SELL-ERROR] ${shortMint} | Failed to sell tokens with low MC`);
-            }
-          } catch (error) {
-            logger.error(`[❌ SELL-ERROR] ${shortMint} | Error during low MC sell: ${error instanceof Error ? error.message : String(error)}`);
-          } finally {
-            this.releaseLock(mintAddress);
-          }
-          return;
+          break; // Only execute one rule at a time
         }
-        
-        // PRIORITY 3: Check loss exit condition
-        if (raisePercent < 0 && Math.abs(raisePercent) > botSellConfig.lossExitPercent) {
-          logger.info(`[💰 SELL-SIGNAL] ${shortMint} | Price dropped below stop loss (${raisePercent.toFixed(2)}% < -${botSellConfig.lossExitPercent}%)`);
-          
-          try {
-            const txResult = await sellTokenSwap(mintAddress, curTokenAmount, true, false);
-            if (txResult) {
-              // Add to pending transactions if valid hash returned
-              if (typeof txResult === 'string') {
-                this.addPendingTransaction(mintAddress, txResult, curTokenAmount);
-                logger.info(`[🔄 PENDING] ${shortMint} | Stop loss sell transaction pending | TxHash: ${txResult.slice(0, 8)}...`);
-              }
-              
-              logger.info(`[✅ SOLD] ${shortMint} | Sold due to stop loss | Amount: ${curTokenAmount / 10 ** TOKEN_DECIMALS} | Price: $${currentPrice_usd.toFixed(6)} | TxHash: ${typeof txResult === 'string' ? txResult.slice(0, 8) + '...' : 'N/A'}`);
-              this.stopMonitoring(mintAddress);
-              return;
-            } else {
-              logger.error(`[❌ SELL-ERROR] ${shortMint} | Failed to sell on stop loss`);
-            }
-          } catch (error) {
-            logger.error(`[❌ SELL-ERROR] ${shortMint} | Error during stop loss sell: ${error instanceof Error ? error.message : String(error)}`);
-          } finally {
-            this.releaseLock(mintAddress);
-          }
-          return;
-        }
-        
-        // PRIORITY 4: Check progressive profit-taking
-        const selling_step = tokenSellingStep.get(mintAddress) || 0;
-        if (selling_step >= 4) {
-          logger.info(`[🏁 COMPLETE] ${shortMint} | All sell steps completed (${selling_step}/4)`);
-          this.stopMonitoring(mintAddress);
-          this.releaseLock(mintAddress);
-          return;
-        }
-        
-        const sellRules = botSellConfig.saleRules;
-        const sellSumPercent = sellRules.reduce((acc, rule) => acc + rule.percent, 0);
-        
-        // Check if we should proceed with a step sell
-        for (let checkStep = selling_step; checkStep < 4; checkStep++) {
-          const rule = sellRules[checkStep];
-          
-          if (raisePercent >= rule.revenue) {
-            logger.info(`[💰 STEP-SELL] ${shortMint} | Step ${checkStep + 1}/4 | Target: ${rule.revenue.toFixed(2)}% | Current: ${raisePercent.toFixed(2)}% | Selling: ${rule.percent}%`);
-            
-            const sellPercent = rule.percent;
-            
-            // Get the invested amount from direct data if possible
-            let investedAmount = 0;
-            if (directData && directData.swapAmount) {
-              investedAmount = Number(directData.swapAmount) * 10 ** TOKEN_DECIMALS;
-              logger.info(`[💾 USING-DIRECT-AMOUNT] ${shortMint} | Using amount from direct data: ${directData.swapAmount}`);
-            } else {
-              investedAmount = tokenData.investedAmount * 10 ** TOKEN_DECIMALS;
-              logger.info(`[💾 USING-ASSET-AMOUNT] ${shortMint} | Using amount from asset service: ${tokenData.investedAmount}`);
-            }
-            
-            let sellAmount;
-            if (checkStep === 3 && sellSumPercent === 100) {
-              // Final step - sell all remaining
-              sellAmount = curTokenAmount;
-              logger.info(`[🔄 FINAL-SELL] ${shortMint} | Selling all remaining tokens: ${curTokenAmount / 10 ** TOKEN_DECIMALS}`);
-            } else {
-              // Partial sell according to the rule
-              sellAmount = Math.min(
-                Math.floor((investedAmount * sellPercent) / 100), 
-                curTokenAmount
-              );
-              logger.info(`[🔄 PARTIAL-SELL] ${shortMint} | Selling ${sellAmount / 10 ** TOKEN_DECIMALS} tokens (${sellPercent}% of initial investment)`);
-            }
-            
-            try {
-              const txResult = await sellTokenSwap(
-                mintAddress, 
-                sellAmount, 
-                checkStep === 3, 
-                false
-              );
-              
-              if (txResult) {
-                // Add to pending transactions if valid hash returned
-                if (typeof txResult === 'string') {
-                  this.addPendingTransaction(mintAddress, txResult, sellAmount, checkStep);
-                  logger.info(`[🔄 PENDING] ${shortMint} | Step ${checkStep + 1} sell transaction pending | TxHash: ${txResult.slice(0, 8)}...`);
-                }
-                
-                logger.info(`[✅ STEP-SOLD] ${shortMint} | Successfully executed step ${checkStep + 1} sell | Amount: ${sellAmount / 10 ** TOKEN_DECIMALS} | Price: $${currentPrice_usd.toFixed(6)} | TxHash: ${typeof txResult === 'string' ? txResult.slice(0, 8) + '...' : 'N/A'}`);
-                
-                tokenSellingStep.set(mintAddress, checkStep + 1);
-                
-                if (checkStep === 3) {
-                  this.stopMonitoring(mintAddress);
-                }
-              } else {
-                logger.error(`[❌ SELL-ERROR] ${shortMint} | Failed to execute step ${checkStep + 1} sell`);
-              }
-            } catch (error) {
-              logger.error(`[❌ SELL-ERROR] ${shortMint} | Error during step ${checkStep + 1} sell: ${error instanceof Error ? error.message : String(error)}`);
-            } finally {
-              this.releaseLock(mintAddress);
-            }
-            
-            break; // Only execute one rule at a time
-          }
-        }
-        
-        // If we got here, we didn't execute any sell operation
-        this.releaseLock(mintAddress);
-        
-      } catch (error) {
-        // Make sure to release the lock in case of any error
-        this.releaseLock(mintAddress);
-        throw error;
       }
     } catch (error) {
       logger.error(`[❌ EVAL-ERROR] Error evaluating sell conditions for ${shortMint}: ${error instanceof Error ? error.message : String(error)}`);
@@ -1191,9 +1083,6 @@ export class WssMonitorService {
       // Clear pending transactions
       pendingTransactions.delete(mintAddress);
       
-      // Clear lock
-      tokenSellingLock.set(mintAddress, false);
-      
       // Clear direct data
       tokenBuyTxInfo.delete(mintAddress);
       
@@ -1243,9 +1132,8 @@ export class WssMonitorService {
         this.memoryMonitorInterval = null;
       }
       
-      // Clear all pending transactions and locks
+      // Clear all pending transactions
       pendingTransactions.clear();
-      tokenSellingLock.clear();
       
       // Clear direct data
       tokenBuyTxInfo.clear();

@@ -65,6 +65,7 @@ export const removeTokenBuyingMap = (value: string) => {
  * @returns Formatted error message
  */
 function formatSolanaError(error: any): string {
+  console.log(JSON.stringify(error))
   try {
     if (typeof error === 'string') {
       return error;
@@ -392,24 +393,10 @@ const prepareBuyMonitoringData = (
  * @returns Transaction data or null if timeout/error
  */
 const fetchTransactionWithTimeout = async (signature: string) => {
-  // Create a promise that rejects after timeout
-  const timeoutPromise = new Promise((_, reject) => {
-    setTimeout(() => reject(new Error('Transaction fetch timed out')), TX_FETCH_TIMEOUT);
-  });
-
-  try {
-    // Race the fetch against the timeout
-    return await Promise.race([
-      connection.getParsedTransaction(signature, {
-        maxSupportedTransactionVersion: 0,
-        commitment: "confirmed",
-      }),
-      timeoutPromise
-    ]);
-  } catch (error) {
-    logger.error(`[❌ TX-TIMEOUT] Transaction fetch for ${signature.slice(0, 8)}... timed out or failed: ${error instanceof Error ? error.message : String(error)}`);
-    return null;
-  }
+  return await connection.getParsedTransaction(signature, {
+    maxSupportedTransactionVersion: 0,
+    commitment: "confirmed",
+  })
 };
 
 /**
@@ -702,9 +689,9 @@ export async function sniperService() {
                                   errorString.includes("Custom:6005");
             
             if (!isCommonError) {
-              logger.error(`[❌ LOGS-ERROR] ${signature.slice(0, 8)}... | ${formatSolanaError(err)}`);
+              logger.error(`[❌ LOGS-ERROR] ${signature} | ${formatSolanaError(err)}`);
             }
-            return;
+            //return;
           }
           
           // Check if we've already processed this signature
