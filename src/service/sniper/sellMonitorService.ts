@@ -15,6 +15,8 @@ const tokenSellingStep: Map<string, number> = new Map();
 const tokenCreatedTime: Map<string, number> = new Map();
 // Map to store PriceMonitor instances
 const priceMonitors: Map<string, PriceMonitor> = new Map();
+// Map to store direct buy transaction info
+const directBuyData: Map<string, Partial<ITransaction>> = new Map();
 
 const poolKeyMap: Map<string, LiquidityPoolKeys> = new Map();
 export function getPoolKeyMap(mint: string) {
@@ -42,10 +44,20 @@ function getTokenShortName(mint: string): string {
   return `${mint.slice(0, 8)}...`;
 }
 
-let botSellConfig = SniperBotConfig.getSellConfig();
-
-export const tokenMonitorThread2Sell = async (mint: string) => {
+/**
+ * Start monitoring a token for selling opportunities
+ * Now supports direct data handoff from buying process
+ */
+export const tokenMonitorThread2Sell = async (mint: string, buyTxInfo?: Partial<ITransaction>) => {
   const shortMint = getTokenShortName(mint);
+  
+  // If direct buy info is provided, store it
+  if (buyTxInfo) {
+    directBuyData.set(mint, buyTxInfo);
+    logger.info(`[💾 DIRECT-DATA] ${shortMint} | Received direct transaction data for monitoring`);
+    logger.info(`[📊 DATA-DETAILS] ${shortMint} | Price: $${buyTxInfo.swapPrice_usd?.toFixed(6)}, Amount: ${buyTxInfo.swapAmount?.toFixed(6)}`);
+  }
+  
   logger.info(`[🔍 MONITOR] Starting monitor thread for token ${shortMint}`);
   
   // Add logging to track direct initialization
@@ -55,17 +67,36 @@ export const tokenMonitorThread2Sell = async (mint: string) => {
   }
   
   try {
-    const tokenTxns = await SniperTxns.find({ mint }).sort({ date: -1 });
-    const buyTx: ITransaction | undefined = tokenTxns.find((txn) => txn.swap === "BUY");
+    // First try using direct data from buy transaction
+    let buyTx: Partial<ITransaction> | undefined;
+    let tokenTxns: ITransaction[] = [];
+    
+    if (directBuyData.has(mint)) {
+      buyTx = directBuyData.get(mint);
+      logger.info(`[💾 USING-DIRECT-DATA] ${shortMint} | Using direct transaction data provided during handoff`);
+    } else {
+      // Fall back to database lookup
+      tokenTxns = await SniperTxns.find({ mint }).sort({ date: -1 });
+      buyTx = tokenTxns.find((txn) => txn.swap === "BUY");
+      
+      if (!buyTx) {
+        logger.warn(`[❌ ERROR] No buy transaction found for token ${shortMint}`);
+        tokenSellingStep.delete(mint);
+        return;
+      }
+      
+      logger.info(`[💾 USING-DB-DATA] ${shortMint} | Found transaction data in database`);
+    }
 
+    // Check if buyTx is undefined before using it
     if (!buyTx) {
-      logger.warn(`[❌ ERROR] No buy transaction found for token ${shortMint}`);
+      logger.warn(`[❌ ERROR] Invalid buy transaction data for token ${shortMint}`);
       tokenSellingStep.delete(mint);
       return;
     }
 
-    const investedPrice_usd = Number(buyTx.swapPrice_usd);
-    const investedAmount = Number(buyTx.swapAmount) * 10 ** TOKEN_DECIMALS;
+    const investedPrice_usd = Number(buyTx.swapPrice_usd || 0);
+    const investedAmount = Number(buyTx.swapAmount || 0) * 10 ** TOKEN_DECIMALS;
     
     if (!investedPrice_usd) {
       logger.warn(`[❌ ERROR] Invalid invested price for token ${shortMint}`);
@@ -73,21 +104,24 @@ export const tokenMonitorThread2Sell = async (mint: string) => {
       return;
     }
 
-    const selling_step = tokenTxns.length - 1;
+    // Set the selling step appropriately
+    const selling_step = tokenTxns.length ? tokenTxns.length - 1 : 0;
     tokenSellingStep.set(mint, selling_step);
     
     // Set creation time if not already set
     if (!tokenCreatedTime.has(mint)) {
-      tokenCreatedTime.set(mint, buyTx.txTime);
+      tokenCreatedTime.set(mint, buyTx.txTime || Date.now());
+      logger.info(`[🕒 TIME-SET] ${shortMint} | Creation time set to ${new Date(tokenCreatedTime.get(mint)!).toISOString()}`);
     }
     
-    const tokenAge = Date.now() - (buyTx.txTime || Date.now());
+    const tokenAge = Date.now() - (tokenCreatedTime.get(mint) || Date.now());
     logger.info(`[📊 INFO] ${shortMint} | Age: ${formatTimeElapsed(tokenAge)} | Buy Price: $${investedPrice_usd.toFixed(6)} | Initial Amount: ${(investedAmount / 10 ** TOKEN_DECIMALS).toFixed(4)} | Sell History: ${selling_step} txns`);
 
     try {
       const { price: initialPrice_usd } = await getPumpTokenPriceUSD(mint);
       
       // Initialize PriceMonitor once, outside of the MonitorThread
+      const botSellConfig = SniperBotConfig.getSellConfig();
       const durationSec = typeof botSellConfig.mcChange.duration === 'number' ? 
         (botSellConfig.mcChange.duration > 1000 ? botSellConfig.mcChange.duration / 1000 : botSellConfig.mcChange.duration) : 
         60; // Default to 60 seconds if undefined
@@ -113,6 +147,7 @@ export const tokenMonitorThread2Sell = async (mint: string) => {
             logger.info(`[🚫 ZERO] ${shortMint} | Current token amount is zero, stopping monitor`);
             tokenSellingStep.delete(mint);
             priceMonitors.delete(mint);
+            directBuyData.delete(mint);
             return;
           }
 
@@ -121,6 +156,7 @@ export const tokenMonitorThread2Sell = async (mint: string) => {
             logger.info(`[🏁 COMPLETE] ${shortMint} | All sell steps completed (${selling_step}/4)`);
             tokenSellingStep.delete(mint);
             priceMonitors.delete(mint);
+            directBuyData.delete(mint);
             return;
           }
 
@@ -139,7 +175,7 @@ export const tokenMonitorThread2Sell = async (mint: string) => {
             // Periodic logging of token status (every 3 minutes)
             const just_now = Math.floor(now / 1000);
             if(just_now % 180 === 0) {
-              const ageFormatted = formatTimeElapsed(now - (buyTx?.txTime || now));
+              const ageFormatted = formatTimeElapsed(now - (tokenCreatedTime.get(mint) || now));
               const priceChangePercent = ((currentPrice_usd / investedPrice_usd) - 1) * 100;
               logger.info(`[📈 STATUS] ${shortMint} | Age: ${ageFormatted} | Price: $${currentPrice_usd.toFixed(6)} (${priceChangePercent > 0 ? "+" : ""}${priceChangePercent.toFixed(2)}%)`);
             }
@@ -152,9 +188,10 @@ export const tokenMonitorThread2Sell = async (mint: string) => {
                 const txHash = await sellTokenSwap(mint, curTokenAmount, true, false);
                 
                 if (txHash) {
-                  logger.info(`[✅ SOLD] ${shortMint} | Sold due to insufficient price growth | Amount: ${curTokenAmount / 10 ** TOKEN_DECIMALS} | Price: $${currentPrice_usd.toFixed(6)} | TxHash: ${txHash.slice(0, 8)}...`);
+                  logger.info(`[✅ SOLD] ${shortMint} | Sold due to insufficient price growth | Amount: ${curTokenAmount / 10 ** TOKEN_DECIMALS} | Price: $${currentPrice_usd.toFixed(6)} | TxHash: ${typeof txHash === 'string' ? txHash.slice(0, 8) + '...' : 'tx executed'}`);
                   tokenSellingStep.delete(mint);
                   priceMonitors.delete(mint);
+                  directBuyData.delete(mint);
                   return;
                 } else {
                   logger.error(`[❌ SELL-ERROR] ${shortMint} | Failed to sell due to price stagnation`);
@@ -164,6 +201,7 @@ export const tokenMonitorThread2Sell = async (mint: string) => {
               }
             }
 
+            // Get current price change percentage
             const raisePercent = ((currentPrice_usd / investedPrice_usd) - 1) * 100;
             
             // Check for stop loss
@@ -173,9 +211,10 @@ export const tokenMonitorThread2Sell = async (mint: string) => {
               try {
                 const txHash = await sellTokenSwap(mint, curTokenAmount, true, false);
                 if (txHash) {
-                  logger.info(`[✅ SOLD] ${shortMint} | Sold due to stop loss | Amount: ${curTokenAmount / 10 ** TOKEN_DECIMALS} | Price: $${currentPrice_usd.toFixed(6)} | TxHash: ${txHash.slice(0, 8)}...`);
+                  logger.info(`[✅ SOLD] ${shortMint} | Sold due to stop loss | Amount: ${curTokenAmount / 10 ** TOKEN_DECIMALS} | Price: $${currentPrice_usd.toFixed(6)} | TxHash: ${typeof txHash === 'string' ? txHash.slice(0, 8) + '...' : 'tx executed'}`);
                   tokenSellingStep.delete(mint);
                   priceMonitors.delete(mint);
+                  directBuyData.delete(mint);
                   return;
                 } else {
                   logger.error(`[❌ FAILED] ${shortMint} | Failed to sell tokens due to stop loss`);
@@ -196,7 +235,7 @@ export const tokenMonitorThread2Sell = async (mint: string) => {
 
               const sellAmount = remainPercent === 0 && sellSumPercent === 100
                 ? curTokenAmount // Sell all remaining amount
-                : Math.min((investedAmount * sellPercent) / 100, investedAmount);
+                : Math.min((investedAmount * sellPercent) / 100, curTokenAmount);
 
               logger.info(`[💰 STEP-SELL] ${shortMint} | Step ${chk_step + 1}/4 | Target: ${sellRules[chk_step].revenue.toFixed(2)}% | Current: ${raisePercent.toFixed(2)}% | Selling: ${sellPercent}% (${sellAmount / 10 ** TOKEN_DECIMALS} tokens)`);
               
@@ -204,8 +243,15 @@ export const tokenMonitorThread2Sell = async (mint: string) => {
                 const txHash = await sellTokenSwap(mint, sellAmount, chk_step === 3, false);
 
                 if (txHash) {
-                  logger.info(`[✅ STEP-SOLD] ${shortMint} | Successfully executed step ${chk_step + 1} sell | Amount: ${sellAmount / 10 ** TOKEN_DECIMALS} | TxHash: ${txHash.slice(0, 8)}...`);
+                  logger.info(`[✅ STEP-SOLD] ${shortMint} | Successfully executed step ${chk_step + 1} sell | Amount: ${sellAmount / 10 ** TOKEN_DECIMALS} | TxHash: ${typeof txHash === 'string' ? txHash.slice(0, 8) + '...' : 'tx executed'}`);
                   tokenSellingStep.set(mint, chk_step + 1);
+                  
+                  // If this was the final step, clean up
+                  if (chk_step === 3) {
+                    priceMonitors.delete(mint);
+                    directBuyData.delete(mint);
+                    return;
+                  }
                 } else {
                   logger.error(`[❌ FAILED] ${shortMint} | Failed to execute step ${chk_step + 1} sell`);
                 }
@@ -224,6 +270,7 @@ export const tokenMonitorThread2Sell = async (mint: string) => {
         }
       }
       
+      // Start the monitoring thread
       MonitorThread();
     } catch (initError) {
       logger.error(`[❌ INIT-ERROR] Failed to initialize price monitor for ${shortMint}: ${initError instanceof Error ? initError.message : String(initError)}`);
@@ -233,12 +280,15 @@ export const tokenMonitorThread2Sell = async (mint: string) => {
   }
 };
 
+/**
+ * Main service function that periodically scans wallet tokens and starts monitoring threads
+ */
 export const sellMonitorService = async () => {
   logger.info(`${START_TXT.sell} ✨ PumpFun Sell monitor service started at ${new Date().toISOString()}`);
   
   async function monitorLoop() {
     try {
-      botSellConfig = SniperBotConfig.getSellConfig();
+      const botSellConfig = SniperBotConfig.getSellConfig();
       const tokens = await getWalletTokens(wallet.publicKey);
       
       if(tokens.length > 0) {
@@ -264,5 +314,6 @@ export const sellMonitorService = async () => {
     }
   }
   
+  // Start the main monitoring loop
   monitorLoop();
 };

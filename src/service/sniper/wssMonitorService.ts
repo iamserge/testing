@@ -25,8 +25,6 @@ interface PendingTransaction {
   timestamp: number;
   sellStep?: number;
   isStagnationSell?: boolean;
-  isSimulating?: boolean; // Added flag for simulating transactions
-  expiryTime?: number;    // Added specific expiry time
 }
 
 // Maps for tracking token state
@@ -34,12 +32,11 @@ const tokenSellingStep: Map<string, number> = new Map();
 const tokenCreatedTime: Map<string, number> = new Map();
 const statusLogIntervals: Map<string, NodeJS.Timeout> = new Map();
 const tokenPriceData: Map<string, PriceData> = new Map();
-// New map to track pending transactions
 const pendingTransactions: Map<string, PendingTransaction[]> = new Map();
-// New map to track cooldown periods
-// New map to track active sell operations (global lock)
 const tokenSellingLock: Map<string, boolean> = new Map();
-// New map for unified evaluation queue
+
+// New map to store direct buy transaction info (without DB lookups)
+const tokenBuyTxInfo: Map<string, Partial<ITransaction>> = new Map();
 
 // Helper function to format time elapsed
 function formatTimeElapsed(ms: number): string {
@@ -65,11 +62,7 @@ export class WssMonitorService {
   private static isInitialized: boolean = false;
   private static syncInterval: NodeJS.Timeout | null = null;
   private static activeMonitorInterval: NodeJS.Timeout | null = null;
-  // Debounce settings
-  private static readonly DEBOUNCE_INTERVAL_MS: number = 1000; // 1 second debounce
-  private static readonly COOLDOWN_AFTER_SELL_MS: number = 5000; // Increased from 3000 to 5000ms
   private static readonly GLOBAL_LOCK_TIMEOUT_MS: number = 15000; // 15 second lock timeout
-  private static readonly FAILED_TX_COOLDOWN_MS: number = 3000; // 3 second cooldown after failed tx
   private static readonly MAX_CONCURRENT_OPERATIONS = 3;
   private static activeOperationCount = 0;
   private static memoryMonitorInterval: NodeJS.Timeout | null = null;
@@ -77,7 +70,6 @@ export class WssMonitorService {
   /**
    * Helper method to acquire a global selling lock
    */
-  
   private static acquireLock(mintAddress: string): boolean {
     // Check if the specific token is locked
     if (tokenSellingLock.get(mintAddress)) {
@@ -114,7 +106,6 @@ export class WssMonitorService {
     this.activeOperationCount = Math.max(0, this.activeOperationCount - 1);
   }
   
- 
   /**
    * Initialize the WebSocket monitoring service
    */
@@ -127,6 +118,7 @@ export class WssMonitorService {
     // Initialize maps
     pendingTransactions.clear();
     tokenSellingLock.clear();
+    tokenBuyTxInfo.clear();
     
     // Initial sync of monitored tokens
     this.syncMonitoredTokens();
@@ -178,14 +170,10 @@ export class WssMonitorService {
           try {
             // Check if there's an active lock first
             if (tokenSellingLock.get(mintAddress)) {
-              logger.info(`[🔒 ACTIVE-MONITOR] ${shortMint} | Skipping check due to active lock`);
               continue;
             }
             
-            // Check if there's an active cooldown
-          
-            
-            // Queue the evaluation instead of running it directly
+            // Direct evaluation without queuing or debouncing
             try {
               const tokenData = await getTokenDataforAssets(mintAddress);
               const { price: currentPrice_usd } = await getPumpTokenPriceUSD(mintAddress);
@@ -235,9 +223,40 @@ export class WssMonitorService {
   }
 
   /**
-   * Start monitoring a token
+   * NEW METHOD: Start monitoring a token with direct transaction data
+   * This method allows monitoring to start immediately without waiting for database records
    */
-  public static async startMonitoring(mintAddress: string): Promise<void> {
+  public static async startMonitoringWithData(
+    mintAddress: string, 
+    buyTxInfo: Partial<ITransaction>
+  ): Promise<void> {
+    const shortMint = getTokenShortName(mintAddress);
+    
+    try {
+      // Store the buy transaction info directly in memory
+      tokenBuyTxInfo.set(mintAddress, buyTxInfo);
+      logger.info(`[💾 DIRECT-DATA] ${shortMint} | Stored direct buy transaction data. Price: $${buyTxInfo.swapPrice_usd?.toFixed(6)}, Amount: ${buyTxInfo.swapAmount?.toFixed(6)}`);
+      
+      // Set creation time to now if not already set
+      if (!tokenCreatedTime.has(mintAddress)) {
+        tokenCreatedTime.set(mintAddress, buyTxInfo.txTime || Date.now());
+      }
+      
+      // Initialize selling step to 0 (first purchase)
+      tokenSellingStep.set(mintAddress, 0);
+      
+      // Now start monitoring with direct data
+      await this.startMonitoringWithDirectData(mintAddress);
+    } catch (error) {
+      logger.error(`[❌ DIRECT-MONITOR-ERROR] ${shortMint} | Error starting monitoring with direct data: ${error instanceof Error ? error.message : String(error)}`);
+      throw error;
+    }
+  }
+
+  /**
+   * Internal method to start monitoring with direct data
+   */
+  private static async startMonitoringWithDirectData(mintAddress: string): Promise<void> {
     const shortMint = getTokenShortName(mintAddress);
     
     try {
@@ -258,11 +277,71 @@ export class WssMonitorService {
       // Initialize lock as unlocked
       tokenSellingLock.set(mintAddress, false);
       
+      logger.info(`[🔍 MONITOR] Starting WebSocket monitoring for token: ${shortMint} (source: direct handoff)`);
+  
+      // Initialize token data with direct info
+      await this.initializeDirectTokenMonitoring(mintAddress);
+  
+      // Subscribe to the token's liquidity pool account changes
+      const poolData = await this.findLiquidityPoolForToken(mintAddress);
+      if (poolData && poolData.poolAddress) {
+        const subscriptionId = connection.onAccountChange(
+          poolData.poolAddress,
+          (accountInfo, context) => this.handlePoolAccountChange(mintAddress, accountInfo, context),
+          'confirmed'
+        );
+        this.activeSubscriptions.set(mintAddress, subscriptionId);
+        
+        const initTimeMs = Date.now() - monitorStartTime;
+        logger.info(`[🔌 CONNECTED] WebSocket subscription established for ${shortMint} (pool account) in ${initTimeMs}ms`);
+      } else {
+        // Fallback to program subscription if pool not found
+        this.subscribeToTokenProgram(mintAddress);
+        
+        const initTimeMs = Date.now() - monitorStartTime;
+        logger.info(`[🔌 CONNECTED] Token program subscription established for ${shortMint} in ${initTimeMs}ms`);
+      }
+    } catch (error) {
+      logger.error(`[❌ MONITOR-ERROR] Error starting monitoring with direct data for ${shortMint}: ${error instanceof Error ? error.message : String(error)}`);
+      throw error;
+    }
+  }
+
+  /**
+   * Start monitoring a token (normal method, tries to load data from DB)
+   */
+  public static async startMonitoring(mintAddress: string): Promise<void> {
+    const shortMint = getTokenShortName(mintAddress);
+    
+    try {
+      // Check if we already have direct data for this token
+      if (tokenBuyTxInfo.has(mintAddress)) {
+        logger.info(`[🔄 DIRECT-DATA] ${shortMint} | Using existing direct data instead of database lookup`);
+        return this.startMonitoringWithDirectData(mintAddress);
+      }
+      
+      // Add a timestamp to track when monitoring started
+      const monitorStartTime = Date.now();
+      
+      if (this.activeSubscriptions.has(mintAddress)) {
+        logger.info(`[⚠️ DUPLICATE] Already monitoring ${shortMint} - skipping initialization`);
+        return;
+      }
+  
+      const mint = new PublicKey(mintAddress);
+      this.monitoredTokens.set(mintAddress, mint);
+      
+      // Initialize pending transactions array
+      pendingTransactions.set(mintAddress, []);
+      
+      // Initialize lock as unlocked
+      tokenSellingLock.set(mintAddress, false);
+      
       // Enhance logging to track the source of initialization
-      const initSource = tokenCreatedTime.has(mintAddress) ? "periodic scan" : "direct handoff";
+      const initSource = tokenCreatedTime.has(mintAddress) ? "periodic scan" : "database lookup";
       logger.info(`[🔍 MONITOR] Starting WebSocket monitoring for token: ${shortMint} (source: ${initSource})`);
   
-      // Initialize token data
+      // Initialize token data from database
       await this.initializeTokenMonitoring(mintAddress);
   
       // Subscribe to the token's liquidity pool account changes
@@ -291,7 +370,84 @@ export class WssMonitorService {
   }
 
   /**
-   * Initialize token monitoring data
+   * Initialize token monitoring data from direct buy info (no DB lookup)
+   */
+  private static async initializeDirectTokenMonitoring(mintAddress: string): Promise<void> {
+    const shortMint = getTokenShortName(mintAddress);
+    
+    try {
+      const startTime = Date.now();
+      
+      // Get the direct buy transaction info
+      const buyTx = tokenBuyTxInfo.get(mintAddress);
+      
+      if (!buyTx) {
+        logger.error(`[❌ ERROR] No direct buy transaction data found for token ${shortMint}`);
+        return;
+      }
+      
+      const investedPrice_usd = Number(buyTx.swapPrice_usd || 0);
+      const investedAmount = Number(buyTx.swapAmount || 0) * 10 ** TOKEN_DECIMALS;
+      
+      if (!investedPrice_usd) {
+        logger.error(`[❌ ERROR] Invalid invested price in direct data for token ${shortMint}`);
+        return;
+      }
+      
+      // Set selling step to 0 (first step)
+      tokenSellingStep.set(mintAddress, 0);
+      
+      // Set creation time if not already set
+      if (!tokenCreatedTime.has(mintAddress)) {
+        tokenCreatedTime.set(mintAddress, buyTx.txTime || Date.now());
+      }
+      
+      const tokenAge = Date.now() - (buyTx.txTime || Date.now());
+      const ageFormatted = formatTimeElapsed(tokenAge);
+      
+      logger.info(`[📊 INFO] ${shortMint} | Age: ${ageFormatted} | Buy Price: $${investedPrice_usd.toFixed(6)} | Initial Amount: ${(investedAmount / 10 ** TOKEN_DECIMALS).toFixed(4)} | Direct Data Used`);
+      
+      // Initialize price monitoring
+      try {
+        const { price: initialPrice_usd } = await getPumpTokenPriceUSD(mintAddress);
+        
+        const botSellConfig = SniperBotConfig.getSellConfig();
+        const durationSec = typeof botSellConfig.mcChange?.duration === 'number' ? 
+          (botSellConfig.mcChange.duration > 1000 ? botSellConfig.mcChange.duration / 1000 : botSellConfig.mcChange.duration) : 
+          10; // Default to 10 seconds if undefined
+        
+        const percentValue = typeof botSellConfig.mcChange?.percentValue === 'number' ? 
+          botSellConfig.mcChange.percentValue : 25; // Default to 25% if undefined
+        
+        logger.info(`[⚙️ CONFIG] ${shortMint} | Exit Loss: -${botSellConfig.lossExitPercent}% | Min Growth: +${percentValue}% in ${durationSec}s | Profit Targets: ${botSellConfig.saleRules.map(r => `+${r.revenue}%`).join(', ')}`);
+        
+        // Create price data for monitoring
+        const priceData: PriceData = {
+          initialPrice: initialPrice_usd,
+          threshold: percentValue / 100,
+          duration: durationSec * 1000, // Convert to milliseconds
+          startTime: Date.now()
+        };
+        
+        // Store the price data in the map
+        tokenPriceData.set(mintAddress, priceData);
+        
+        const initTimeMs = Date.now() - startTime;
+        logger.info(`[🔄 PRICE-MONITOR] ${shortMint} | Created with initial price $${initialPrice_usd.toFixed(6)}, threshold ${percentValue}%, duration ${durationSec}s | Init time: ${initTimeMs}ms`);
+      } catch (priceError) {
+        logger.error(`[❌ PRICE-ERROR] Failed to initialize price monitoring for ${shortMint}: ${priceError instanceof Error ? priceError.message : String(priceError)}`);
+      }
+      
+      // Set up periodic status logging (every 60 seconds)
+      this.setupStatusLogging(mintAddress, buyTx.txTime || Date.now(), investedPrice_usd);
+      
+    } catch (error) {
+      logger.error(`[❌ DIRECT-INIT-ERROR] Error initializing direct token data for ${shortMint}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /**
+   * Initialize token monitoring data from database
    */
   private static async initializeTokenMonitoring(mintAddress: string): Promise<void> {
     const shortMint = getTokenShortName(mintAddress);
@@ -299,12 +455,18 @@ export class WssMonitorService {
     try {
       const startTime = Date.now();
       
-      // Get token transaction history
+      // Get token transaction history from database
       const tokenTxns = await SniperTxns.find({ mint: mintAddress }).sort({ date: -1 });
       const buyTx: ITransaction | undefined = tokenTxns.find((txn) => txn.swap === "BUY");
   
       if (!buyTx) {
-        logger.warn(`[❌ ERROR] No buy transaction found for token ${shortMint}`);
+        logger.warn(`[❌ DB-ERROR] No buy transaction found in database for token ${shortMint}`);
+        // Check if we have direct data as fallback
+        if (tokenBuyTxInfo.has(mintAddress)) {
+          logger.info(`[🔄 FALLBACK] ${shortMint} | Using direct data as fallback for missing database record`);
+          return this.initializeDirectTokenMonitoring(mintAddress);
+        }
+        
         tokenSellingStep.delete(mintAddress);
         return;
       }
@@ -313,7 +475,7 @@ export class WssMonitorService {
       const investedAmount = Number(buyTx.swapAmount) * 10 ** TOKEN_DECIMALS;
       
       if (!investedPrice_usd) {
-        logger.warn(`[❌ ERROR] Invalid invested price for token ${shortMint}`);
+        logger.warn(`[❌ DB-ERROR] Invalid invested price in database for token ${shortMint}`);
         tokenSellingStep.delete(mintAddress);
         return;
       }
@@ -322,10 +484,9 @@ export class WssMonitorService {
       tokenSellingStep.set(mintAddress, selling_step);
       
       // Set creation time if not already set
-      const isNewMonitor = !tokenCreatedTime.has(mintAddress);
-      if (isNewMonitor) {
+      if (!tokenCreatedTime.has(mintAddress)) {
         tokenCreatedTime.set(mintAddress, buyTx.txTime);
-        logger.info(`[🆕 NEW-MONITOR] ${shortMint} | Created new monitoring context`);
+        logger.info(`[🔄 DB-DATA] ${shortMint} | Using database transaction time: ${new Date(buyTx.txTime).toISOString()}`);
       }
       
       const tokenAge = Date.now() - (buyTx.txTime || Date.now());
@@ -368,7 +529,7 @@ export class WssMonitorService {
       this.setupStatusLogging(mintAddress, buyTx.txTime, investedPrice_usd);
       
     } catch (error) {
-      logger.error(`[❌ INIT-ERROR] Error initializing token data for ${shortMint}: ${error instanceof Error ? error.message : String(error)}`);
+      logger.error(`[❌ DB-INIT-ERROR] Error initializing token data from database for ${shortMint}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -470,15 +631,9 @@ export class WssMonitorService {
         const priceChangePercent = ((currentPrice_usd / buyPrice) - 1) * 100;
         const mcUsd = currentPrice_usd * TOTAL_SUPPLY;
         
-        // Log pending transactions if any
-        const pending = pendingTransactions.get(mintAddress) || [];
-        const pendingInfo = pending.length > 0 ? 
-          ` | Pending Txs: ${pending.length}` : '';
+        // Log basic status
+        logger.info(`[📈 STATUS] ${shortMint} | Age: ${ageFormatted} | Price: $${currentPrice_usd.toFixed(6)} (${priceChangePercent > 0 ? "+" : ""}${priceChangePercent.toFixed(2)}%) | MC: $${(mcUsd/1000).toFixed(1)}K`);
         
-        // Log lock status
-        const lockStatus = tokenSellingLock.get(mintAddress) ? ' | 🔒 LOCKED' : '';
-        
-   
         // Log price monitor status if available
         const status = this.getPriceMonitorStatus(mintAddress);
         if (status) {
@@ -487,7 +642,7 @@ export class WssMonitorService {
       } catch (error) {
         logger.error(`[❌ STATUS-ERROR] Error logging status for ${shortMint}: ${error instanceof Error ? error.message : String(error)}`);
       }
-    }, 60000); // Every 60 seconds (reduced from 180,000ms)
+    }, 60000); // Every 60 seconds
     
     statusLogIntervals.set(mintAddress, interval);
   }
@@ -517,33 +672,22 @@ export class WssMonitorService {
     txHash: string, 
     amount: number, 
     sellStep?: number,
-    isStagnationSell = false,
-    isSimulating = false,
-    expiryTimeMs = 300000 // Default 5 minutes, shorter for simulating
+    isStagnationSell = false
   ): void {
     const shortMint = getTokenShortName(mintAddress);
     const pending = pendingTransactions.get(mintAddress) || [];
-    
-    // If it's a simulation transaction, use a shorter expiry time
-    if (isSimulating) {
-      expiryTimeMs = 10000; // 10 seconds for simulation transactions
-    }
     
     pending.push({
       txHash,
       amount,
       timestamp: Date.now(),
       sellStep,
-      isStagnationSell,
-      isSimulating,
-      expiryTime: Date.now() + expiryTimeMs
+      isStagnationSell
     });
     
     pendingTransactions.set(mintAddress, pending);
     
-    logger.info(`[📝 PENDING-ADD] ${shortMint} | Added ${isSimulating ? 'simulating ' : ''}transaction to pending list: ${txHash.slice(0, 8)}... | Total: ${pending.length}`);
-    
-    // Set a cooldown to prevent rapid subsequent sell attempts
+    logger.info(`[📝 PENDING-ADD] ${shortMint} | Added transaction to pending list: ${txHash.slice(0, 8)}... | Total: ${pending.length}`);
   }
 
   /**
@@ -553,15 +697,11 @@ export class WssMonitorService {
     const shortMint = getTokenShortName(mintAddress);
     const pending = pendingTransactions.get(mintAddress) || [];
     
-    // Find the transaction to log its details
-    const tx = pending.find(t => t.txHash === txHash);
-    const txType = tx?.isSimulating ? 'simulating ' : '';
-    
     const filtered = pending.filter(tx => tx.txHash !== txHash);
     pendingTransactions.set(mintAddress, filtered);
     
     if (pending.length !== filtered.length) {
-      logger.info(`[📝 PENDING-REMOVE] ${shortMint} | Removed ${txType}transaction from pending list: ${txHash.slice(0, 8)}... | Remaining: ${filtered.length}`);
+      logger.info(`[📝 PENDING-REMOVE] ${shortMint} | Removed transaction from pending list: ${txHash.slice(0, 8)}... | Remaining: ${filtered.length}`);
     }
   }
 
@@ -572,11 +712,8 @@ export class WssMonitorService {
     const pending = pendingTransactions.get(mintAddress) || [];
     const now = Date.now();
     
-    // Use the explicit expiry time from each transaction
-    const filtered = pending.filter(tx => {
-      const expiryTime = tx.expiryTime || (tx.timestamp + 300000); // Default 5 minutes if no expiry time
-      return now < expiryTime;
-    });
+    // Use a fixed 5 minute expiration time
+    const filtered = pending.filter(tx => now - tx.timestamp < 300000);
     
     if (filtered.length !== pending.length) {
       const shortMint = getTokenShortName(mintAddress);
@@ -724,6 +861,9 @@ export class WssMonitorService {
     }
   }
 
+  /**
+   * Clean up oldest monitors to free memory
+   */
   private static cleanupOldestMonitors(count: number): void {
     try {
       // Get tokens sorted by creation time (oldest first)
@@ -743,6 +883,7 @@ export class WssMonitorService {
       logger.error(`[❌ CLEANUP-ERROR] Error cleaning up old monitors: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
+
   /**
    * Evaluate if selling conditions are met
    */
@@ -761,9 +902,7 @@ export class WssMonitorService {
         return;
       }
       
-      
-      
-      // Third check - do we have pending transactions?
+      // Second check - do we have pending transactions?
       if (this.hasPendingTransaction(mintAddress)) {
         const pendingList = pendingTransactions.get(mintAddress) || [];
         logger.info(`[⏳ PENDING] ${shortMint} | Evaluation skipped due to ${pendingList.length} pending transactions`);
@@ -783,7 +922,19 @@ export class WssMonitorService {
         return;
       }
 
-      const investedPrice_usd = tokenData.investedPrice_usd || 0;
+      // Use directly passed data if available, fall back to token data
+      let investedPrice_usd = 0;
+      
+      // Try to get the invested price from direct data first
+      const directData = tokenBuyTxInfo.get(mintAddress);
+      if (directData && directData.swapPrice_usd) {
+        investedPrice_usd = Number(directData.swapPrice_usd);
+        logger.info(`[💾 USING-DIRECT-DATA] ${shortMint} | Using price from direct data: $${investedPrice_usd.toFixed(6)}`);
+      } else {
+        // Fall back to token data from assets service
+        investedPrice_usd = tokenData.investedPrice_usd || 0;
+        logger.info(`[💾 USING-ASSET-DATA] ${shortMint} | Using price from asset service: $${investedPrice_usd.toFixed(6)}`);
+      }
       
       if (investedPrice_usd === 0) {
         logger.warn(`[❌ ERROR] No invested price found for ${shortMint}, skipping evaluation`);
@@ -817,17 +968,6 @@ export class WssMonitorService {
               this.stopMonitoring(mintAddress);
               return;
             } else {
-              // Track failed transaction
-              this.addPendingTransaction(
-                mintAddress, 
-                `sim-${Date.now()}`, 
-                curTokenAmount, 
-                undefined, 
-                true, 
-                true, 
-                10000 // 10 second expiry for simulation failures
-              );
-              
               logger.error(`[❌ SELL-ERROR] ${shortMint} | Failed to sell tokens due to insufficient growth`);
             }
           } catch (error) {
@@ -859,17 +999,6 @@ export class WssMonitorService {
               this.stopMonitoring(mintAddress);
               return;
             } else {
-              // Track failed transaction
-              this.addPendingTransaction(
-                mintAddress, 
-                `sim-${Date.now()}`, 
-                curTokenAmount, 
-                undefined, 
-                false, 
-                true, 
-                10000
-              );
-              
               logger.error(`[❌ SELL-ERROR] ${shortMint} | Failed to sell tokens with low MC`);
             }
           } catch (error) {
@@ -897,17 +1026,6 @@ export class WssMonitorService {
               this.stopMonitoring(mintAddress);
               return;
             } else {
-              // Track failed transaction
-              this.addPendingTransaction(
-                mintAddress, 
-                `sim-${Date.now()}`, 
-                curTokenAmount, 
-                undefined, 
-                false, 
-                true, 
-                10000
-              );
-              
               logger.error(`[❌ SELL-ERROR] ${shortMint} | Failed to sell on stop loss`);
             }
           } catch (error) {
@@ -938,7 +1056,16 @@ export class WssMonitorService {
             logger.info(`[💰 STEP-SELL] ${shortMint} | Step ${checkStep + 1}/4 | Target: ${rule.revenue.toFixed(2)}% | Current: ${raisePercent.toFixed(2)}% | Selling: ${rule.percent}%`);
             
             const sellPercent = rule.percent;
-            const investedAmount = tokenData.investedAmount * 10 ** TOKEN_DECIMALS;
+            
+            // Get the invested amount from direct data if possible
+            let investedAmount = 0;
+            if (directData && directData.swapAmount) {
+              investedAmount = Number(directData.swapAmount) * 10 ** TOKEN_DECIMALS;
+              logger.info(`[💾 USING-DIRECT-AMOUNT] ${shortMint} | Using amount from direct data: ${directData.swapAmount}`);
+            } else {
+              investedAmount = tokenData.investedAmount * 10 ** TOKEN_DECIMALS;
+              logger.info(`[💾 USING-ASSET-AMOUNT] ${shortMint} | Using amount from asset service: ${tokenData.investedAmount}`);
+            }
             
             let sellAmount;
             if (checkStep === 3 && sellSumPercent === 100) {
@@ -977,17 +1104,6 @@ export class WssMonitorService {
                   this.stopMonitoring(mintAddress);
                 }
               } else {
-                // Track failed transaction
-                this.addPendingTransaction(
-                  mintAddress, 
-                  `sim-${Date.now()}`, 
-                  sellAmount, 
-                  checkStep, 
-                  false, 
-                  true, 
-                  10000
-                );
-                
                 logger.error(`[❌ SELL-ERROR] ${shortMint} | Failed to execute step ${checkStep + 1} sell`);
               }
             } catch (error) {
@@ -1044,8 +1160,6 @@ export class WssMonitorService {
         }
       } else {
         logger.error(`[❌ TX-FAILED] ${shortMint} | Transaction ${txHash.slice(0, 8)}... failed`);
-        
-        // Add a cooldown after failed transaction to prevent rapid retries
       }
       
       // Remove the transaction from pending list
@@ -1074,17 +1188,14 @@ export class WssMonitorService {
         tokenPriceData.delete(mintAddress);
       }
       
-      
-      
-   
-      
-      // Clear cooldown
-      
       // Clear pending transactions
       pendingTransactions.delete(mintAddress);
       
       // Clear lock
       tokenSellingLock.set(mintAddress, false);
+      
+      // Clear direct data
+      tokenBuyTxInfo.delete(mintAddress);
       
       // Remove WebSocket subscription
       const subscriptionId = this.activeSubscriptions.get(mintAddress);
@@ -1126,13 +1237,18 @@ export class WssMonitorService {
         this.activeMonitorInterval = null;
       }
       
-    
+      // Clear memory monitor
+      if (this.memoryMonitorInterval) {
+        clearInterval(this.memoryMonitorInterval);
+        this.memoryMonitorInterval = null;
+      }
       
-     
-      
-      // Clear all cooldowns, pending transactions and locks
+      // Clear all pending transactions and locks
       pendingTransactions.clear();
       tokenSellingLock.clear();
+      
+      // Clear direct data
+      tokenBuyTxInfo.clear();
       
       // Remove all WebSocket subscriptions
       for (const [mintAddress, subscriptionId] of this.activeSubscriptions.entries()) {
