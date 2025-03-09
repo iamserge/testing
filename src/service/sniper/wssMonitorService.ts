@@ -1,4 +1,4 @@
-import { AccountInfo, Context, PublicKey } from "@solana/web3.js";
+import { AccountInfo, Context, PublicKey, VersionedTransaction} from "@solana/web3.js";
 import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import { connection, wallet, START_TXT } from "../../config";
 import logger from "../../logs/logger";

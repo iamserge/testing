@@ -246,10 +246,10 @@ export const swap = async (
             logger.info(`[✅ CLOSE-COMPLETE] ${shortMint} | Account closed successfully: ${closeAccountTxHash.slice(0, 8)}...`);
           }
         }
-        
+        const solPrice = getCachedSolPrice();
+
         // For burn operations, set appropriate values
         if (swapMethod.includes("tokenClose")) {
-          const solPrice = getCachedSolPrice();
           logger.info(`[🔥 BURN-COMPLETE] ${shortMint} | Token successfully burned | Amount: ${formatAmount(adjustedAmount)}`);
           
           return {
@@ -257,16 +257,20 @@ export const swap = async (
             price: is_buy ? 0 : price || solPrice,
             inAmount: adjustedAmount,
             outAmount: 0,
-            closeAccountTxHash
+            closeAccountTxHash,
+            vTxn, // Add the transaction object
+            needsAccountClose: true // Add needsAccountClose property
           };
         }
-        
+
         return {
           txHash,
-          price,
-          inAmount,
-          outAmount,
-          closeAccountTxHash
+          price: is_buy ? 0 : price || solPrice,
+          inAmount: adjustedAmount,
+          outAmount: 0,
+          closeAccountTxHash,
+          vTxn, // Add the transaction object
+          needsAccountClose: false // Add needsAccountClose property
         };
       } catch (error) {
         logger.error(`[❌ EXECUTION-ERROR] ${shortMint} | Transaction execution failed: ${error instanceof Error ? error.message : String(error)}`);

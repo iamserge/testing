@@ -297,7 +297,7 @@ export const sellTokenSwap = async (mint: string, amount: number, isAlert: boole
     }
     
     const { txHash, price: executedPrice_usd, inAmount, outAmount, } = swapResult;
-    logger.info(`[✅ SWAP-SUCCESS] ${shortMint} | Swap executed at price: $${executedPrice_usd.toFixed(6)}`);
+    logger.info(`[✅ SWAP-SUCCESS] ${shortMint} | Swap executed at price: $${(executedPrice_usd || 0).toFixed(6)}`);
     logger.info(`[📝 TX-DETAILS] ${shortMint} | TxHash: ${txHash?.slice(0, 8)}... | In: ${inAmount.toFixed(6)} tokens | Out: ${outAmount.toFixed(6)} SOL`);
     
     // For regular (non-sellAll) sells, we need to record the transaction
@@ -313,9 +313,10 @@ export const sellTokenSwap = async (mint: string, amount: number, isAlert: boole
       }
       
       const investedPrice_usd = buyTxn?.swapPrice_usd || 0;
-      const profit = (Number(executedPrice_usd - investedPrice_usd) * amount) / 1000_000;
-      const profitPercent = Number(executedPrice_usd / investedPrice_usd - 1) * 100;
-      
+      const executedPriceValue = executedPrice_usd || 0;
+      const profit = (Number(executedPriceValue - investedPrice_usd) * amount) / 1000_000;
+      const profitPercent = Number(executedPriceValue / investedPrice_usd - 1) * 100;
+
       logger.info(`[💹 PROFIT-CALC] ${shortMint} | Buy price: $${investedPrice_usd.toFixed(6)} | Profit: $${profit.toFixed(2)} (${profitPercent.toFixed(2)}%)`);
       
       const solPrice = getCachedSolPrice();
@@ -326,7 +327,7 @@ export const sellTokenSwap = async (mint: string, amount: number, isAlert: boole
         txHash: txHash || "",
         mint: mint,
         swap: "SELL",
-        swapPrice_usd: executedPrice_usd,
+        swapPrice_usd: executedPrice_usd || 0,
         swapAmount: inAmount,
         swapFee_usd: tipAmount * solPrice,
         swapProfit_usd: profit,
@@ -342,7 +343,7 @@ export const sellTokenSwap = async (mint: string, amount: number, isAlert: boole
       logger.info(`[🔥 CLEANUP] ${shortMint} | Token cleaned up successfully with sellAll option`);
     }
     
-    return txHash;
+    return txHash || null;
   } catch (error: any) {
     logger.error(`[❌ SELL-ERROR] ${shortMint} | Error during sellTokenSwap: ${error.message}`);
     if (error.stack) {
