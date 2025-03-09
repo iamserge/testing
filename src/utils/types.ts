@@ -90,6 +90,8 @@ export interface ISwapTxResponse {
   outAmount: number;
   price?: number;
   needsAccountClose: boolean;
+  txHash?: string;
+  closeAccountTxHash?: string | null;
 }
 
 export interface ISwapHashResponse {
