@@ -24,18 +24,73 @@ import { USE_WSS } from "../../index";
 import { ITransaction } from "../../models/SniperTxns";
 
 // Constants
-const PUMP_WALLET = new PublicKey(
-  "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
-);
+const PUMP_WALLET = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
 const COMMITMENT_LEVEL = "confirmed" as Commitment;
 let BUY_MONITOR_CYCLE = SniperBotConfig.getBuyIntervalTime();
 
+// Max time to wait for transaction data (milliseconds)
+const TX_FETCH_TIMEOUT = 7000;
+
+// Common Solana error codes and their meanings
+const ERROR_CODES: Record<string, string> = {
+  "Custom:3007": "Insufficient funds",
+  "Custom:6001": "Invalid instruction data",
+  "Custom:6002": "Invalid account data",
+  "Custom:6003": "Account not initialized",
+  "Custom:6005": "Account already in use",
+  "Custom:6020": "Account not owned by program",
+  "Custom:6023": "Invalid account owner",
+  "Custom:3012": "Transaction error",
+  "IllegalOwner": "Invalid account owner",
+  "ProgramFailedToComplete": "Program execution failed",
+  "InvalidAccountData": "Invalid account data format"
+};
+
 // Track tokens being monitored
 const tokenBuyingMap: Map<string, number> = new Map();
+// Track processed transaction signatures to avoid duplicates
+const processedSignatures: Set<string> = new Set();
+// Rate limiting for log processing
+let lastLogProcessTime = 0;
+const MIN_LOG_PROCESS_INTERVAL = 100; // milliseconds
+
 export const removeTokenBuyingMap = (value: string) => {
   logger.info(`[🔄 BUYING-MAP] Removing token ${value.slice(0, 8)}... from buying map`);
   tokenBuyingMap.delete(value);
 };
+
+/**
+ * Helper function to format error messages from Solana
+ * @param error The error object from Solana
+ * @returns Formatted error message
+ */
+function formatSolanaError(error: any): string {
+  try {
+    if (typeof error === 'string') {
+      return error;
+    }
+
+    if (typeof error === 'object') {
+      if (error.InstructionError) {
+        const [index, errorDetail] = error.InstructionError;
+        
+        if (typeof errorDetail === 'string') {
+          const errorKey = errorDetail as string;
+          return `Instruction ${index} failed: ${errorDetail} (${ERROR_CODES[errorKey] || 'Unknown error'})`;
+        } else if (typeof errorDetail === 'object' && errorDetail.Custom !== undefined) {
+          const errorCode = `Custom:${errorDetail.Custom}`;
+          return `Instruction ${index} failed: Custom error ${errorDetail.Custom} (${ERROR_CODES[errorCode] || 'Unknown custom error'})`;
+        }
+      }
+      
+      return JSON.stringify(error);
+    }
+    
+    return 'Unknown error format';
+  } catch (e) {
+    return `Error parsing error: ${e}`;
+  }
+}
 
 /**
  * Validates a token based on bot configuration
@@ -83,13 +138,44 @@ export const validateToken = async (mint: string, dev: PublicKey) => {
 
     const validationStart = Date.now();
     logger.info(`[🔍 VALIDATE] ${shortMint} | Awaiting all validation checks...`);
-    const promiseResult = await Promise.all(promiseArray);
+    
+    // Use Promise.allSettled to ensure all promises complete even if some fail
+    const promiseResults = await Promise.allSettled(promiseArray);
     const validationTime = Date.now() - validationStart;
     
-    const pumpData = promiseResult[pumpid];
-    const _devHolding = promiseResult[devHoldingId];
-    const allAccounts = promiseResult[allAccountsId];
-    const dexData = promiseResult[dexScreenerId];
+    // Extract results from settled promises, handling failures gracefully
+    const pumpDataResult = promiseResults[pumpid];
+    const pumpData = pumpDataResult.status === 'fulfilled' ? pumpDataResult.value : null;
+
+    let _devHolding = 0;
+    if (devHoldingId !== 0) {
+      const devHoldingResult = promiseResults[devHoldingId];
+      if (devHoldingResult && devHoldingResult.status === 'fulfilled') {
+        _devHolding = devHoldingResult.value;
+      }
+    }
+
+    let allAccounts = { length: 0 };
+    if (botBuyConfig.holders.enabled) {
+      const allAccountsResult = promiseResults[allAccountsId];
+      if (allAccountsResult && allAccountsResult.status === 'fulfilled') {
+        allAccounts = allAccountsResult.value;
+      }
+    }
+
+    let dexData = null;
+    if (botBuyConfig.lastHourVolume.enabled || botBuyConfig.lastMinuteTxns.enabled) {
+      const dexDataResult = promiseResults[dexScreenerId];
+      if (dexDataResult && dexDataResult.status === 'fulfilled') {
+        dexData = dexDataResult.value;
+      }
+    }
+
+    // If PumpData fetch failed, we can't proceed
+    if (!pumpData) {
+      logger.error(`[❌ VALIDATE-ERROR] ${shortMint} | Failed to fetch pump data`);
+      return { isValid: false, pumpData: null };
+    }
 
     // Market cap validation
     const _mc = Number(pumpData?.marketCap || 0);
@@ -177,13 +263,21 @@ const checkDuplicates = async (mint: string): Promise<boolean> => {
     
     try {
       logger.info(`[🔍 DUPLICATE-CHECK] ${shortMint} | Fetching from pump.fun API`);
-      const tmpdata = await fetch(`https://frontend-api.pump.fun/coins/${mint}`);
-      const data = await tmpdata.json();
+      const response = await fetch(`https://frontend-api.pump.fun/coins/${mint}`);
+      if (!response.ok) {
+        throw new Error(`API responded with status: ${response.status}`);
+      }
+      
+      const data = await response.json();
       tokenName = data.name;
       tokenSymbol = data.symbol;
       tokenImage = data.image;
       
-      logger.info(`[🔍 DUPLICATE-CHECK] ${shortMint} | API data: Name=${tokenName}, Symbol=${tokenSymbol}`);
+      if (tokenName && tokenSymbol) {
+        logger.info(`[🔍 DUPLICATE-CHECK] ${shortMint} | API data: Name=${tokenName}, Symbol=${tokenSymbol}`);
+      } else {
+        logger.warn(`[⚠️ API-WARNING] ${shortMint} | Incomplete data from API`);
+      }
     } catch (apiError) {
       logger.warn(`[⚠️ API-ERROR] ${shortMint} | Failed to fetch from API: ${apiError instanceof Error ? apiError.message : String(apiError)}`);
     }
@@ -200,12 +294,22 @@ const checkDuplicates = async (mint: string): Promise<boolean> => {
         tokenSymbol = metaPlexData.symbol;
         tokenImage = metaPlexData.json?.image;
         
-        logger.info(`[🔍 DUPLICATE-CHECK] ${shortMint} | Metaplex data: Name=${tokenName}, Symbol=${tokenSymbol}`);
+        if (tokenName && tokenSymbol) {
+          logger.info(`[🔍 DUPLICATE-CHECK] ${shortMint} | Metaplex data: Name=${tokenName}, Symbol=${tokenSymbol}`);
+        } else {
+          logger.warn(`[⚠️ METAPLEX-WARNING] ${shortMint} | Incomplete data from Metaplex`);
+        }
       } catch (metaplexError) {
         logger.error(`[❌ METAPLEX-ERROR] ${shortMint} | Metaplex fetch failed: ${metaplexError instanceof Error ? metaplexError.message : String(metaplexError)}`);
         // If we can't get a symbol, we'll return true to skip this token
         return true;
       }
+    }
+
+    // If we still don't have token info, we can't check for duplicates
+    if (!tokenSymbol) {
+      logger.error(`[❌ TOKEN-ERROR] ${shortMint} | Failed to retrieve token information`);
+      return true;
     }
 
     // Check for duplicates in the database
@@ -283,6 +387,32 @@ const prepareBuyMonitoringData = (
 };
 
 /**
+ * Fetches transaction details with timeout
+ * @param signature The transaction signature
+ * @returns Transaction data or null if timeout/error
+ */
+const fetchTransactionWithTimeout = async (signature: string) => {
+  // Create a promise that rejects after timeout
+  const timeoutPromise = new Promise((_, reject) => {
+    setTimeout(() => reject(new Error('Transaction fetch timed out')), TX_FETCH_TIMEOUT);
+  });
+
+  try {
+    // Race the fetch against the timeout
+    return await Promise.race([
+      connection.getParsedTransaction(signature, {
+        maxSupportedTransactionVersion: 0,
+        commitment: "confirmed",
+      }),
+      timeoutPromise
+    ]);
+  } catch (error) {
+    logger.error(`[❌ TX-TIMEOUT] Transaction fetch for ${signature.slice(0, 8)}... timed out or failed: ${error instanceof Error ? error.message : String(error)}`);
+    return null;
+  }
+};
+
+/**
  * Monitor a token for possible buying opportunity
  * Enhanced with detailed logging and improved error handling
  */
@@ -332,7 +462,7 @@ const monitorToken = async (
 
       // Check if bot is running and within working hours
       if (!isRunning() || !isWorkingTime()) {
-        logger.info(`[🛑 NOT-RUNNING] ${shortMint} | Bot not running or outside working hours`);
+        logger.info(`[🛑 NOT-RUNNING] ${shortMint} | Bot not running or outside working hours. isRunning=${isRunning()}, isWorkingTime=${isWorkingTime()}`);
         setTimeout(run, BUY_MONITOR_CYCLE);
         return;
       }
@@ -362,6 +492,14 @@ const monitorToken = async (
         const tip_sol = buyConfig.jitoTipAmount || 0.00001;
         
         logger.info(`[🔄 SWAP-PREP] ${shortMint} | Preparing swap with investment: ${buyConfig.investmentPerToken} SOL, tip: ${tip_sol} SOL`);
+        
+        // Validate that pumpData has all required fields
+        if (!pumpData.bondingCurve || !pumpData.associatedBondingCurve || 
+            !pumpData.virtualSolReserves || !pumpData.virtualTokenReserves) {
+          logger.error(`[❌ PUMP-DATA-ERROR] ${shortMint} | Incomplete pump data, cannot proceed with swap`);
+          setTimeout(run, BUY_MONITOR_CYCLE);
+          return;
+        }
         
         const swapParam: SwapParam = {
           mint: mint,
@@ -498,6 +636,43 @@ const monitorToken = async (
 };
 
 /**
+ * Checks if a signature has already been processed
+ * @param signature Transaction signature
+ * @returns True if this signature has been seen before
+ */
+function isSignatureProcessed(signature: string): boolean {
+  if (processedSignatures.has(signature)) {
+    return true;
+  }
+  
+  // Add to processed signatures set
+  processedSignatures.add(signature);
+  
+  // Limit size of processed signatures set
+  if (processedSignatures.size > 1000) {
+    // Convert to array, remove oldest entries, convert back to set
+    const signatureArray = Array.from(processedSignatures);
+    processedSignatures.clear();
+    signatureArray.slice(signatureArray.length - 500).forEach(sig => processedSignatures.add(sig));
+  }
+  
+  return false;
+}
+
+/**
+ * Helper function to type cast transaction data
+ */
+interface ParsedTransaction {
+  transaction?: {
+    message?: {
+      instructions?: any[];
+    };
+  };
+  blockTime?: number;
+  meta?: any;
+}
+
+/**
  * Main sniper service function
  * Listens for new token creations and initiates monitoring
  */
@@ -511,8 +686,29 @@ export async function sniperService() {
       PUMP_WALLET,
       async ({ logs, err, signature }) => {
         try {
+          // Rate limiting to prevent processing overload
+          const now = Date.now();
+          if (now - lastLogProcessTime < MIN_LOG_PROCESS_INTERVAL) {
+            return; // Skip this log if we're processing too frequently
+          }
+          lastLogProcessTime = now;
+          
+          // Handle transaction errors more gracefully
           if (err) {
-            logger.error(`[❌ LOGS-ERROR] Error in onLogs handler: ${err}`);
+            // Don't log common errors that aren't relevant to token creation
+            const errorString = JSON.stringify(err);
+            const isCommonError = errorString.includes("IllegalOwner") || 
+                                  errorString.includes("Custom:6023") ||
+                                  errorString.includes("Custom:6005");
+            
+            if (!isCommonError) {
+              logger.error(`[❌ LOGS-ERROR] ${signature.slice(0, 8)}... | ${formatSolanaError(err)}`);
+            }
+            return;
+          }
+          
+          // Check if we've already processed this signature
+          if (isSignatureProcessed(signature)) {
             return;
           }
 
@@ -525,114 +721,151 @@ export async function sniperService() {
           ) {
             logger.info(`[🔍 NEW-TOKEN] Detected new token creation: ${signature.slice(0, 8)}...`);
             
-            // Get transaction details
-            const txn = await connection.getParsedTransaction(signature, {
-              maxSupportedTransactionVersion: 0,
-              commitment: "confirmed",
-            });
+            // Get transaction details with timeout protection
+            const txn = await fetchTransactionWithTimeout(signature) as ParsedTransaction;
 
             if (!txn) {
               logger.error(`[❌ TX-ERROR] Failed to get transaction details for ${signature.slice(0, 8)}...`);
               return;
             }
 
-            // Extract account information
-            //@ts-ignore
-            const accountKeys = txn?.transaction.message.instructions.find((ix) => ix.programId.toString() === PUMP_WALLET.toBase58())?.accounts as PublicKey[];
+            try {
+              // Extract account information
+              const instructions = txn.transaction?.message?.instructions || [];
+              const pumpInstruction = instructions.find(
+                (ix: any) => ix.programId && ix.programId.toString() === PUMP_WALLET.toBase58()
+              );
+              
+              if (!pumpInstruction || !pumpInstruction.accounts) {
+                logger.error(`[❌ INSTRUCTION-ERROR] No valid PUMP instruction found for ${signature.slice(0, 8)}...`);
+                return;
+              }
+              
+              const accountKeys = pumpInstruction.accounts as PublicKey[];
 
-            if (!accountKeys || accountKeys.length < 8) {
-              logger.error(`[❌ KEY-ERROR] Invalid account keys for ${signature.slice(0, 8)}...`);
-              return;
-            }
+              if (!accountKeys || accountKeys.length < 8) {
+                logger.error(`[❌ KEY-ERROR] Invalid account keys for ${signature.slice(0, 8)}... (length: ${accountKeys?.length || 0})`);
+                return;
+              }
 
-            // Extract relevant data
-            const mint = accountKeys[0];
-            const user = accountKeys[7]; // dev address
-            const bondingCurve = accountKeys[2];
-            const associatedBondingCurve = accountKeys[3];
-            const shortMint = mint.toBase58().slice(0, 8) + '...';
-            
-            logger.info(`[🔍 TOKEN-INFO] ${shortMint} | Mint: ${mint.toBase58()}, Dev: ${user.toBase58().slice(0, 8)}...`);
-            
-            // Initialize with default values
-            let virtualSolReserves = 30 * LAMPORTS_PER_SOL;
-            let virtualTokenReserves = 1000000000 * 10 ** 6;
-            
-            if (txn.blockTime && txn.meta) {
-                const solSpent =
-                  Math.abs(txn.meta.postBalances[0] - txn.meta.preBalances[0]) /
-                  LAMPORTS_PER_SOL;
-                  
-                logger.info(`[💰 DEV-SPEND] ${shortMint} | Developer spent: ${solSpent.toFixed(6)} SOL`);
-                
-                // Check if dev spent too much
-                const maxDevBuyAmount = SniperBotConfig.getMaxDevBuyAmount();
-                if (
-                  maxDevBuyAmount.enabled &&
-                  solSpent > maxDevBuyAmount.value
-                ) {
-                  logger.info(`[❌ DEV-SPEND-HIGH] ${shortMint} | Developer spent too much: ${solSpent.toFixed(6)} SOL > limit ${maxDevBuyAmount.value} SOL`);
-                  return;
-                }
+              // Extract relevant data
+              const mint = accountKeys[0];
+              const user = accountKeys[7]; // dev address
+              const bondingCurve = accountKeys[2];
+              const associatedBondingCurve = accountKeys[3];
+              const shortMint = mint.toBase58().slice(0, 8) + '...';
+              
+              logger.info(`[🔍 TOKEN-INFO] ${shortMint} | Mint: ${mint.toBase58()}, Dev: ${user.toBase58().slice(0, 8)}...`);
+              
+              // Initialize with default values
+              let virtualSolReserves = 30 * LAMPORTS_PER_SOL;
+              let virtualTokenReserves = 1000000000 * 10 ** 6;
+              
+              if (txn.blockTime !== undefined && txn.meta) {
+                  try {
+                    // Verify account indices exist in the transaction metadata
+                    if (!txn.meta.preBalances || !txn.meta.postBalances || 
+                        txn.meta.preBalances.length === 0 || txn.meta.postBalances.length === 0) {
+                      logger.error(`[❌ TX-DATA-ERROR] ${shortMint} | Transaction metadata missing balance information`);
+                      return;
+                    }
+                    
+                    const solSpent =
+                      Math.abs(txn.meta.postBalances[0] - txn.meta.preBalances[0]) /
+                      LAMPORTS_PER_SOL;
+                      
+                    logger.info(`[💰 DEV-SPEND] ${shortMint} | Developer spent: ${solSpent.toFixed(6)} SOL`);
+                    
+                    // Check if dev spent too much
+                    const maxDevBuyAmount = SniperBotConfig.getMaxDevBuyAmount();
+                    if (
+                      maxDevBuyAmount.enabled &&
+                      solSpent > maxDevBuyAmount.value
+                    ) {
+                      logger.info(`[❌ DEV-SPEND-HIGH] ${shortMint} | Developer spent too much: ${solSpent.toFixed(6)} SOL > limit ${maxDevBuyAmount.value} SOL`);
+                      return;
+                    }
 
-                // Calculate initial price and liquidity
-                const cachedSolPrice = getCachedSolPrice();
-                const price = cachedSolPrice * (virtualSolReserves / LAMPORTS_PER_SOL) / (virtualTokenReserves / 10 ** 6);
-                
-                // Adjust virtual reserves based on developer spend
-                virtualTokenReserves -= solSpent * 10 ** 6 / price;
-                virtualSolReserves += solSpent * LAMPORTS_PER_SOL;
-                
-                logger.info(`[💰 INITIAL-PRICE] ${shortMint} | Initial price: $${price.toFixed(6)}, SOL Price: $${cachedSolPrice.toFixed(2)}`);
+                    // Calculate initial price and liquidity
+                    const cachedSolPrice = getCachedSolPrice();
+                    if (!cachedSolPrice || cachedSolPrice === 0) {
+                      logger.error(`[❌ PRICE-ERROR] ${shortMint} | Invalid SOL price: ${cachedSolPrice}`);
+                      return;
+                    }
+                    
+                    const price = cachedSolPrice * (virtualSolReserves / LAMPORTS_PER_SOL) / (virtualTokenReserves / 10 ** 6);
+                    
+                    // Adjust virtual reserves based on developer spend
+                    virtualTokenReserves -= solSpent * 10 ** 6 / price;
+                    virtualSolReserves += solSpent * LAMPORTS_PER_SOL;
+                    
+                    logger.info(`[💰 INITIAL-PRICE] ${shortMint} | Initial price: $${price.toFixed(6)}, SOL Price: $${cachedSolPrice.toFixed(2)}`);
 
-                // Create pumpData object for monitoring
-                const pumpData: PumpData = {
-                  bondingCurve,
-                  associatedBondingCurve,
-                  virtualSolReserves,
-                  virtualTokenReserves,
-                  price,
-                  progress: 0,
-                  totalSupply: 1000000000,
-                  marketCap: price * 1000000000
-                };
-                
-                // Check for duplicates
-                let isDuplicated = false;
-                logger.info(`[🔍 DUPLICATE-CHECK] ${shortMint} | Checking for duplicate tokens (enabled: ${SniperBotConfig.getBuyConfig().duplicates.enabled})`);
-                
-                if (SniperBotConfig.getBuyConfig().duplicates.enabled === true) {
-                  isDuplicated = await checkDuplicates(mint.toBase58());
-                } else {
-                  // Still add to database, but don't filter
-                  checkDuplicates(mint.toBase58());
-                }
-                
-                if (isDuplicated) {
-                  logger.info(`[❌ DUPLICATE] ${shortMint} | Duplicate token found, skipping`);
-                  return;
-                }
-                
-                // Check if bot is running
-                if (!isRunning() || !isWorkingTime()) {
-                  logger.info(`[🛑 NOT-RUNNING] ${shortMint} | Bot not running or outside working hours`);
-                  return;
-                }
-                
-                const created_timestamp = txn.blockTime * 1000;
-                logger.info(`[🎯 NEW-TOKEN] ${shortMint} | Starting monitoring process | Created: ${new Date(created_timestamp).toISOString()}`);
-                
-                // Update buy monitor cycle from config
-                BUY_MONITOR_CYCLE = SniperBotConfig.getBuyIntervalTime();
-                
-                // Start monitoring the token
-                monitorToken(mint.toBase58(), pumpData, user, created_timestamp);
-            } else {
-                logger.error(`[❌ TX-DATA-ERROR] ${shortMint} | Missing transaction data: blockTime or meta`);
+                    // Create pumpData object for monitoring
+                    const pumpData: PumpData = {
+                      bondingCurve,
+                      associatedBondingCurve,
+                      virtualSolReserves,
+                      virtualTokenReserves,
+                      price,
+                      progress: 0,
+                      totalSupply: 1000000000,
+                      marketCap: price * 1000000000
+                    };
+                    
+                    // Check for duplicates
+                    let isDuplicated = false;
+                    logger.info(`[🔍 DUPLICATE-CHECK] ${shortMint} | Checking for duplicate tokens (enabled: ${SniperBotConfig.getBuyConfig().duplicates.enabled})`);
+                    
+                    try {
+                      if (SniperBotConfig.getBuyConfig().duplicates.enabled === true) {
+                        isDuplicated = await checkDuplicates(mint.toBase58());
+                      } else {
+                        // Still add to database, but don't filter
+                        checkDuplicates(mint.toBase58()).catch(err => {
+                          logger.error(`[❌ DB-ERROR] ${shortMint} | Error saving token to database: ${err.message}`);
+                        });
+                      }
+                    } catch (dupError) {
+                      logger.error(`[❌ DUPLICATE-ERROR] ${shortMint} | Error checking for duplicates: ${dupError instanceof Error ? dupError.message : String(dupError)}`);
+                      // Continue processing even if duplicate check fails
+                    }
+                    
+                    if (isDuplicated) {
+                      logger.info(`[❌ DUPLICATE] ${shortMint} | Duplicate token found, skipping`);
+                      return;
+                    }
+                    
+                    // Check if bot is running
+                    if (!isRunning() || !isWorkingTime()) {
+                      logger.info(`[🛑 NOT-RUNNING] ${shortMint} | Bot not running or outside working hours. isRunning=${isRunning()}, isWorkingTime=${isWorkingTime()}`);
+                      return;
+                    }
+                    
+                    const created_timestamp = txn.blockTime * 1000;
+                    logger.info(`[🎯 NEW-TOKEN] ${shortMint} | Starting monitoring process | Created: ${new Date(created_timestamp).toISOString()}`);
+                    
+                    // Update buy monitor cycle from config
+                    BUY_MONITOR_CYCLE = SniperBotConfig.getBuyIntervalTime();
+                    
+                    // Start monitoring the token
+                    if (tokenBuyingMap.has(mint.toBase58())) {
+                      logger.info(`[⚠️ ALREADY-MONITORING] ${shortMint} | Token is already being monitored, skipping`);
+                    } else {
+                      monitorToken(mint.toBase58(), pumpData, user, created_timestamp);
+                    }
+                  } catch (dataError) {
+                    logger.error(`[❌ DATA-PROCESSING-ERROR] ${shortMint} | Error processing transaction data: ${dataError instanceof Error ? dataError.message : String(dataError)}`);
+                  }
+              } else {
+                  logger.error(`[❌ TX-DATA-ERROR] ${shortMint} | Missing transaction data: blockTime or meta`);
+              }
+            } catch (instructionError) {
+              logger.error(`[❌ INSTRUCTION-ERROR] Error extracting instruction data for ${signature.slice(0, 8)}...: ${instructionError instanceof Error ? instructionError.message : String(instructionError)}`);
             }
           }
         } catch (e: any) {
-          logger.error(`[❌ LOGS-HANDLER-ERROR] Error processing logs: ${e.message}`);
+          logger.error(`[❌ LOGS-HANDLER-ERROR] Error processing logs for ${signature?.slice(0, 8) || 'unknown'}...: ${e.message}`);
           if (e.stack) {
             logger.error(`[❌ STACK-TRACE] ${e.stack.split('\n').slice(0, 3).join(' | ')}`);
           }
@@ -642,10 +875,30 @@ export async function sniperService() {
     );
     
     logger.info(`[🔌 CONNECTED] Sniper service successfully connected to Solana network`);
+    
+    // Periodically clean up processed signatures to prevent memory leaks
+    setInterval(() => {
+      if (processedSignatures.size > 1000) {
+        logger.info(`[🧹 CLEANUP] Cleaning up processed signatures (count: ${processedSignatures.size})`);
+        const signatureArray = Array.from(processedSignatures);
+        processedSignatures.clear();
+        signatureArray.slice(signatureArray.length - 500).forEach(sig => processedSignatures.add(sig));
+        logger.info(`[🧹 CLEANUP] Reduced processed signatures to ${processedSignatures.size}`);
+      }
+    }, 30 * 60 * 1000); // Clean up every 30 minutes
+    
   } catch (e: any) {
     logger.error(`[❌ CONNECTION-ERROR] Failed to connect sniper service: ${e.message}`);
     if (e.stack) {
       logger.error(`[❌ STACK-TRACE] ${e.stack.split('\n').slice(0, 3).join(' | ')}`);
     }
+    
+    // Try to reconnect after a delay
+    setTimeout(() => {
+      logger.info(`[🔄 RECONNECT] Attempting to reconnect sniper service...`);
+      sniperService().catch(err => {
+        logger.error(`[❌ RECONNECT-FAILED] Failed to reconnect: ${err.message}`);
+      });
+    }, 60 * 1000); // Wait 1 minute before reconnecting
   }
 }
